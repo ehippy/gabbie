@@ -51,16 +51,16 @@ class DashboardScreen(Screen):
                 with Vertical(id="controls-panel"):
                     yield Static("INPUT DEVICE", classes="panel-title")
                     yield Select(
-                        [(0, "Loading...")],
+                        options=[],
                         id="input-device-select",
-                        allow_blank=False,
+                        allow_blank=True,
                     )
 
                     yield Static("OUTPUT DEVICE", classes="panel-title")
                     yield Select(
-                        [(0, "Loading...")],
+                        options=[],
                         id="output-device-select",
-                        allow_blank=False,
+                        allow_blank=True,
                     )
 
                     yield Static("SERVER URL", classes="panel-title")
@@ -115,8 +115,13 @@ class DashboardScreen(Screen):
             input_select = self.query_one("#input-device-select", Select)
             if input_options:
                 input_select.set_options(input_options)
-                default_input = devices.get("default_input", 0)
-                input_select.value = default_input
+                default_input = devices.get("default_input")
+                if default_input is not None:
+                    try:
+                        input_select.value = default_input
+                    except Exception:
+                        input_select.value = input_options[0][0]
+            # No else needed - blank select is fine
 
             # Load output devices
             output_devices = devices.get("output", [])
@@ -127,8 +132,13 @@ class DashboardScreen(Screen):
             output_select = self.query_one("#output-device-select", Select)
             if output_options:
                 output_select.set_options(output_options)
-                default_output = devices.get("default_output", 0)
-                output_select.value = default_output
+                default_output = devices.get("default_output")
+                if default_output is not None:
+                    try:
+                        output_select.value = default_output
+                    except Exception:
+                        output_select.value = output_options[0][0]
+            # No else needed - blank select is fine
 
     def _load_config(self) -> None:
         """Load configuration from daemon."""
