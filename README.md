@@ -2,6 +2,34 @@
 
 A lightweight voice assistant gateway optimized for resource-constrained devices (Raspberry Pi 3 with 512MB RAM).
 
+## nu notes
+Core Architecture:
+- src/config.py - Configuration management with TOML persistence
+- src/audio_manager.py - Audio device enumeration
+- src/voice_gateway.py - Core VoiceGatewayService with STT→LLM→TTS pipeline
+Daemon & IPC:
+- src/daemon.py - Daemon process with Unix socket IPC server
+CLI:
+- src/cli.py - Typer-based CLI with commands: gabbie, daemon, tui, config, devices
+TUI (Textual):
+- src/tui/app.py - Main TUI application with CSS styling
+- src/tui/screens.py - Dashboard, History, and Settings screens
+- src/tui/widgets.py - Custom StatusIndicator widget
+- src/tui/client.py - IPC client for TUI-daemon communication
+Commands Available
+gabbie                    # Launch TUI (auto-starts daemon)
+gabbie devices            # List audio devices
+gabbie config --show      # Show configuration
+gabbie config --input 7   # Set input device
+gabbie daemon start       # Start daemon
+gabbie daemon stop        # Stop daemon  
+gabbie daemon status      # Check status
+TUI Features
+- Dashboard: Device dropdowns, server URL config, Start/Stop buttons, live activity log
+- History: Conversation history viewer
+- Settings: Edit wake word thresholds, model selections
+- Key bindings: Q=quit, H=history, S=settings, R=refresh
+
 ## Architecture
 
 ```
