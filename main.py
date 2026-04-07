@@ -45,6 +45,8 @@ class Config:
     channels: int = 1
     chunk_size: int = 1280  # 80ms @ 16kHz = 1280 bytes
     format: int = pyaudio.paInt16
+    input_device_index: int | None = None
+    output_device_index: int | None = None
 
     # Wake word settings
     wake_word: str = "alexa"
@@ -71,11 +73,89 @@ class Config:
 config = Config()
 
 
-class AudioRecorder:
-    """Records audio from microphone at 16kHz."""
+def list_audio_devices():
+    """List all available audio devices for input and output."""
+    logger.info("Enumerating audio devices...")
+    logger.info("=" * 60)
 
-    def __init__(self):
+    p = pyaudio.PyAudio()
+
+    input_devices = []
+    output_devices = []
+
+    for i in range(p.get_device_count()):
+        try:
+            info = p.get_device_info_by_index(i)
+            name = info.get("name", f"Device {i}")
+            max_input = info.get("maxInputChannels", 0)
+            max_output = info.get("maxOutputChannels", 0)
+            default_rate = int(info.get("defaultSampleRate", 0))
+
+            if max_input > 0:
+                input_devices.append(
+                    {
+                        "index": i,
+                        "name": name,
+                        "channels": max_input,
+                        "rate": default_rate,
+                    }
+                )
+
+            if max_output > 0:
+                output_devices.append(
+                    {
+                        "index": i,
+                        "name": name,
+                        "channels": max_output,
+                        "rate": default_rate,
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Could not get info for device {i}: {e}")
+
+    default_input = p.get_default_input_device_info()
+    default_output = p.get_default_output_device_info()
+
+    logger.info(
+        f"\nDEFAULT INPUT (index {int(default_input['index'])}): {default_input['name']}"
+    )
+    logger.info(
+        f"DEFAULT OUTPUT (index {int(default_output['index'])}): {default_output['name']}"
+    )
+    logger.info("-" * 60)
+
+    logger.info(f"\nINPUT DEVICES ({len(input_devices)} found):")
+    for dev in input_devices:
+        marker = " <-- DEFAULT" if dev["index"] == int(default_input["index"]) else ""
+        logger.info(
+            f"  [{dev['index']}] {dev['name']} ({dev['channels']}ch, {dev['rate']}Hz){marker}"
+        )
+
+    logger.info(f"\nOUTPUT DEVICES ({len(output_devices)} found):")
+    for dev in output_devices:
+        marker = " <-- DEFAULT" if dev["index"] == int(default_output["index"]) else ""
+        logger.info(
+            f"  [{dev['index']}] {dev['name']} ({dev['channels']}ch, {dev['rate']}Hz){marker}"
+        )
+
+    logger.info("=" * 60)
+
+    p.terminate()
+
+    return {
+        "input": input_devices,
+        "output": output_devices,
+        "default_input": int(default_input["index"]),
+        "default_output": int(default_output["index"]),
+    }
+
+
+class AudioRecorder:
+    """Records audio from microphone."""
+
+    def __init__(self, device_index: int | None = None):
         self.paudio = pyaudio.PyAudio()
+        self.device_index = device_index
         self.stream = None
         self.is_recording = False
         self.audio_queue = queue.Queue()
@@ -83,20 +163,41 @@ class AudioRecorder:
     def start(self):
         """Start recording from microphone."""
         try:
-            self.stream = self.paudio.open(
-                format=config.format,
-                channels=config.channels,
-                rate=config.sample_rate,
-                input=True,
-                frames_per_buffer=config.chunk_size,
-                stream_callback=self._audio_callback,
+            kwargs = {
+                "format": config.format,
+                "channels": config.channels,
+                "rate": config.sample_rate,
+                "input": True,
+                "frames_per_buffer": config.chunk_size,
+                "stream_callback": self._audio_callback,
+            }
+            device_index = (
+                self.device_index
+                if self.device_index is not None
+                else config.input_device_index
             )
+            if device_index is not None:
+                kwargs["input_device_index"] = device_index
+
+            self.stream = self.paudio.open(**kwargs)
             self.is_recording = True
             self.stream.start_stream()
-            logger.info("Audio recording started")
+            device_name = self._get_device_name(device_index) or "default"
+            logger.info(f"Audio recording started on device: {device_name}")
         except Exception as e:
             logger.error(f"Failed to start audio recording: {e}")
             raise
+
+    def _get_device_name(self, index: int | None) -> str | None:
+        """Get device name by index."""
+        try:
+            if index is None:
+                info = self.paudio.get_default_input_device_info()
+                index = int(info["index"])
+            info = self.paudio.get_device_info_by_index(index)
+            return str(info.get("name", f"Device {index}"))
+        except:
+            return None
 
     def stop(self):
         """Stop recording."""
@@ -354,20 +455,38 @@ class AudioPlayer:
     def play(self, audio_data: bytes):
         """Play audio data."""
         try:
-            self.stream = self.paudio.open(
-                format=pyaudio.paInt16,
-                channels=config.channels,
-                rate=config.sample_rate,
-                output=True,
-            )
+            kwargs = {
+                "format": pyaudio.paInt16,
+                "channels": config.channels,
+                "rate": config.sample_rate,
+                "output": True,
+            }
+            if config.output_device_index is not None:
+                kwargs["output_device_index"] = config.output_device_index
+
+            self.stream = self.paudio.open(**kwargs)
             self.stream.write(audio_data)
             self.stream.stop_stream()
             self.stream.close()
-            logger.info("Audio playback complete")
+            device_name = self._get_device_name() or "default"
+            logger.info(f"Audio playback complete on device: {device_name}")
         except Exception as e:
             logger.error(f"Failed to play audio: {e}")
         finally:
             self.paudio.terminate()
+
+    def _get_device_name(self) -> str | None:
+        """Get output device name."""
+        try:
+            if config.output_device_index is None:
+                info = self.paudio.get_default_output_device_info()
+                index = int(info["index"])
+            else:
+                index = config.output_device_index
+            info = self.paudio.get_device_info_by_index(index)
+            return str(info.get("name", f"Device {index}"))
+        except:
+            return None
 
 
 class Gabbie:
@@ -473,6 +592,7 @@ class Gabbie:
 def main():
     """Entry point."""
     try:
+        list_audio_devices()
         gabbie = Gabbie()
         gabbie.run()
     except KeyboardInterrupt:
