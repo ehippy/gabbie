@@ -57,21 +57,22 @@ Screen {
 }
 
 #main-grid {
-    height: auto;
-    grid-size: 3;
+    height: 100%;
+    margin-top: 1;
+    grid-size: 2;
     grid-rows: 1fr;
-    grid-columns: 30fr 50fr 20fr;
+    grid-columns: 1fr 2fr;
 }
 
 #controls-panel {
-    height: auto;
+    height: 100%;
     padding: 1;
     background: $surface;
     border: solid $primary;
 }
 
 #log-panel {
-    height: auto;
+    height: 100%;
     padding: 1;
     background: $surface;
     border: solid $primary;
@@ -88,7 +89,8 @@ Screen {
 .panel-title {
     text-style: bold;
     color: $primary;
-    margin-bottom: 0;
+    margin-bottom: 1;
+    height: 1;
 }
 
 Select {
@@ -111,7 +113,7 @@ Input {
 }
 
 #activity-log {
-    height: 100%;
+    height: -1;
     background: $panel;
     border: tall $primary;
     padding: 0 1;

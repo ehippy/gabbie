@@ -107,9 +107,11 @@ class DashboardScreen(Screen):
             devices = response.get("data", {})
 
             # Load input devices
+            # Select expects (label, value) format
             input_devices = devices.get("input", [])
             input_options = [
-                (d["index"], f"{d['name']} ({d['channels']}ch)") for d in input_devices
+                (f"{d['name']} ({d['channels']}ch)", str(d["index"]))
+                for d in input_devices
             ]
 
             input_select = self.query_one("#input-device-select", Select)
@@ -117,16 +119,20 @@ class DashboardScreen(Screen):
                 input_select.set_options(input_options)
                 default_input = devices.get("default_input")
                 if default_input is not None:
-                    try:
-                        input_select.value = default_input
-                    except Exception:
-                        input_select.value = input_options[0][0]
-            # No else needed - blank select is fine
+                    matching_option = next(
+                        (opt for opt in input_options if opt[1] == str(default_input)),
+                        None,
+                    )
+                    if matching_option:
+                        self.call_after_refresh(
+                            lambda: setattr(input_select, "value", matching_option[1])
+                        )
 
             # Load output devices
             output_devices = devices.get("output", [])
             output_options = [
-                (d["index"], f"{d['name']} ({d['channels']}ch)") for d in output_devices
+                (f"{d['name']} ({d['channels']}ch)", str(d["index"]))
+                for d in output_devices
             ]
 
             output_select = self.query_one("#output-device-select", Select)
@@ -134,11 +140,18 @@ class DashboardScreen(Screen):
                 output_select.set_options(output_options)
                 default_output = devices.get("default_output")
                 if default_output is not None:
-                    try:
-                        output_select.value = default_output
-                    except Exception:
-                        output_select.value = output_options[0][0]
-            # No else needed - blank select is fine
+                    matching_option = next(
+                        (
+                            opt
+                            for opt in output_options
+                            if opt[1] == str(default_output)
+                        ),
+                        None,
+                    )
+                    if matching_option:
+                        self.call_after_refresh(
+                            lambda: setattr(output_select, "value", matching_option[1])
+                        )
 
     def _load_config(self) -> None:
         """Load configuration from daemon."""
@@ -185,18 +198,24 @@ TTS Voice: {config.get("tts_voice", "N/A")}
             if response and response.get("status") == "ok":
                 self._log(f"[green]{response.get('message')}[/]")
             else:
-                self._log(
-                    f"[red]Failed to start: {response.get('message', 'Unknown error')}[/]"
+                message = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "Unknown error"
                 )
+                self._log(f"[red]Failed to start: {message}[/]")
 
         elif event.button.id == "stop-btn":
             response = self.client.stop()
             if response and response.get("status") == "ok":
                 self._log(f"[yellow]{response.get('message')}[/]")
             else:
-                self._log(
-                    f"[red]Failed to stop: {response.get('message', 'Unknown error')}[/]"
+                message = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "Unknown error"
                 )
+                self._log(f"[red]Failed to stop: {message}[/]")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle device selection changes."""

@@ -58,6 +58,11 @@ class DaemonIPCServer:
                 client.settimeout(1.0)
                 self._clients.append(client)
                 logger.info(f"Client connected, total clients: {len(self._clients)}")
+                # Start a thread to handle this client
+                client_thread = threading.Thread(
+                    target=self._handle_client, args=(client,), daemon=True
+                )
+                client_thread.start()
             except socket.timeout:
                 continue
             except Exception as e:
