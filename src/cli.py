@@ -291,8 +291,16 @@ def tui():
     """Launch the TUI interface."""
     if not is_daemon_running():
         typer.echo("Daemon not running. Starting daemon...")
-        cmd = [sys.executable, "-m", "src.daemon"]
-        process = subprocess.Popen(cmd, start_new_session=True)
+        log_dir = Path.home() / ".gabbie"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "gabbie.log"
+        cmd = [sys.executable, "-m", "src.daemon", "--log", "DEBUG"]
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file.open("a"),
+            stderr=log_file.open("a"),
+            start_new_session=True,
+        )
         time.sleep(1)
 
     from src.tui.app import main as tui_main

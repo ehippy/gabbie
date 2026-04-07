@@ -10,7 +10,18 @@ from textual.widgets import Static
 
 from src.tui.screens import DashboardScreen, HistoryScreen, SettingsScreen
 
-logging.basicConfig(level=logging.WARNING)
+log_dir = Path.home() / ".gabbie"
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / "gabbie.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 

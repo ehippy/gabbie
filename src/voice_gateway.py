@@ -161,6 +161,21 @@ class VoiceGatewayService:
         """Start the audio input stream."""
         self._paudio = pyaudio.PyAudio()
 
+        device_info = None
+        if self.config.input_device_index is not None:
+            try:
+                device_info = self._paudio.get_device_info_by_index(
+                    self.config.input_device_index
+                )
+                logger.info(
+                    f"Using input device: {device_info.get('name')} (index {self.config.input_device_index})"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Invalid input device index {self.config.input_device_index}: {e}"
+                )
+                raise
+
         kwargs = {
             "format": pyaudio.paInt16,
             "channels": self.config.channels,
@@ -182,6 +197,12 @@ class VoiceGatewayService:
         if status:
             logger.debug(f"Audio stream status: {status}")
         self._audio_queue.put(in_data)
+        if logger.isEnabledFor(logging.DEBUG):
+            # Log first few seconds of audio data to verify stream is working
+            non_zero = sum(1 for b in in_data if b != 0)
+            logger.debug(
+                f"Audio callback: {frame_count} frames, {non_zero}/{len(in_data) // 2} non-zero samples"
+            )
         return (None, pyaudio.paContinue)
 
     def _audio_loop(self) -> None:
@@ -189,12 +210,16 @@ class VoiceGatewayService:
         while self._running and self._state == GatewayState.LISTENING:
             try:
                 audio_data = self._audio_queue.get(timeout=0.1)
-                if self._wake_model and self._detect_wake_word(audio_data):
-                    self._set_state(GatewayState.DETECTED)
-                    self._push_event(
-                        "wake_word_detected", {"confidence": self._last_confidence}
-                    )
-                    self._start_recording()
+                if self._wake_model:
+                    confidence = self._detect_wake_word(audio_data)
+                    if logger.isEnabledFor(logging.DEBUG) and confidence > 0.1:
+                        logger.debug(f"Wake word check: confidence = {confidence:.4f}")
+                    if confidence:
+                        self._set_state(GatewayState.DETECTED)
+                        self._push_event(
+                            "wake_word_detected", {"confidence": self._last_confidence}
+                        )
+                        self._start_recording()
             except queue.Empty:
                 continue
             except Exception as e:
@@ -208,6 +233,12 @@ class VoiceGatewayService:
 
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
         predictions = self._wake_model.predict(audio_array)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            if predictions:
+                for word, score in predictions.items():
+                    if score > 0.01:
+                        logger.debug(f"Wake word '{word}': {score:.4f}")
 
         if predictions and self.config.wake_word in predictions:
             score = predictions[self.config.wake_word]
@@ -498,3 +529,4 @@ class VoiceGatewayService:
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
                 logger.info(f"Updated config: {key} = {value}")
+        self.config.save()

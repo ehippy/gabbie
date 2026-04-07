@@ -106,6 +106,15 @@ class DashboardScreen(Screen):
         if response and response.get("status") == "ok":
             devices = response.get("data", {})
 
+            # Get saved config to find selected devices
+            config_response = self.client.get_config()
+            saved_input = None
+            saved_output = None
+            if config_response and config_response.get("status") == "ok":
+                config = config_response.get("data", {})
+                saved_input = config.get("input_device_index")
+                saved_output = config.get("output_device_index")
+
             # Load input devices
             # Select expects (label, value) format
             input_devices = devices.get("input", [])
@@ -117,10 +126,15 @@ class DashboardScreen(Screen):
             input_select = self.query_one("#input-device-select", Select)
             if input_options:
                 input_select.set_options(input_options)
-                default_input = devices.get("default_input")
-                if default_input is not None:
+                # Use saved device index, fall back to default
+                target_index = (
+                    saved_input
+                    if saved_input is not None
+                    else devices.get("default_input")
+                )
+                if target_index is not None:
                     matching_option = next(
-                        (opt for opt in input_options if opt[1] == str(default_input)),
+                        (opt for opt in input_options if opt[1] == str(target_index)),
                         None,
                     )
                     if matching_option:
@@ -138,14 +152,15 @@ class DashboardScreen(Screen):
             output_select = self.query_one("#output-device-select", Select)
             if output_options:
                 output_select.set_options(output_options)
-                default_output = devices.get("default_output")
-                if default_output is not None:
+                # Use saved device index, fall back to default
+                target_index = (
+                    saved_output
+                    if saved_output is not None
+                    else devices.get("default_output")
+                )
+                if target_index is not None:
                     matching_option = next(
-                        (
-                            opt
-                            for opt in output_options
-                            if opt[1] == str(default_output)
-                        ),
+                        (opt for opt in output_options if opt[1] == str(target_index)),
                         None,
                     )
                     if matching_option:
@@ -220,11 +235,11 @@ TTS Voice: {config.get("tts_voice", "N/A")}
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle device selection changes."""
         if event.select.id == "input-device-select":
-            self.client.update_config(input_device_index=event.value)
+            self.client.update_config(input_device_index=int(event.value))
             self._log(f"[dim]Input device changed to {event.value}[/]")
 
         elif event.select.id == "output-device-select":
-            self.client.update_config(output_device_index=event.value)
+            self.client.update_config(output_device_index=int(event.value))
             self._log(f"[dim]Output device changed to {event.value}[/]")
 
     def on_input_changed(self, event: Input.Changed) -> None:

@@ -1,4 +1,4 @@
-"""IPC client for TUI- daemon communication."""
+"""IPC client for TUI-daemon communication."""
 
 import json
 import logging
@@ -59,18 +59,46 @@ class DaemonClient:
         try:
             data = json.dumps(message).encode() + b"\n"
             self._client.sendall(data)
+            logger.debug(f"Sent command: {command}")
 
             response = b""
             while True:
                 chunk = self._client.recv(4096)
                 if not chunk:
+                    if response:
+                        logger.warning(
+                            f"Connection closed but got response: {response}"
+                        )
                     break
                 response += chunk
                 if response.endswith(b"\n"):
                     break
 
-            return json.loads(response.decode())
+            if not response:
+                logger.error(f"Empty response for command: {command}")
+                return None
 
+            response_str = response.decode().strip()
+            logger.debug(f"Received response: {response_str}")
+
+            lines = response_str.split("\n")
+            for line in lines:
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict) and data.get("status") in ("ok", "error"):
+                        return data
+                except json.JSONDecodeError:
+                    continue
+
+            logger.error(f"No valid response found in: {response_str}")
+            return None
+
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"JSON decode error for command {command}: {e}. Raw response: {response}"
+            )
+            self._connected = False
+            return None
         except Exception as e:
             logger.error(f"Command failed: {e}")
             self._connected = False

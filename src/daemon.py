@@ -99,18 +99,11 @@ class DaemonIPCServer:
 
     def _forward_events(self) -> None:
         """Forward gateway events to all connected clients."""
+        # Event broadcasting disabled to avoid interfering with command/response flow
+        # Events can be re-enabled when TUI client properly handles them
         while self._running:
             try:
-                event = self._gateway.get_event(block=False)
-                if event:
-                    self._broadcast(
-                        {
-                            "type": "event",
-                            "event_type": event.event_type,
-                            "data": event.data,
-                            "timestamp": event.timestamp,
-                        }
-                    )
+                self._gateway.get_event(block=False)
                 time.sleep(0.05)
             except Exception:
                 continue
@@ -170,35 +163,37 @@ class DaemonIPCServer:
     def _handle_command(self, message: dict) -> dict:
         """Handle a command from client."""
         command = message.get("command")
+        logger.debug(f"Received command: {command}")
 
-        if command == "start":
-            self._gateway.start()
-            return {"status": "ok", "message": "Gateway started"}
+        try:
+            if command == "start":
+                self._gateway.start()
+                response = {"status": "ok", "message": "Gateway started"}
+            elif command == "stop":
+                self._gateway.stop()
+                response = {"status": "ok", "message": "Gateway stopped"}
+            elif command == "get_status":
+                response = {"status": "ok", "data": self._gateway.get_status()}
+            elif command == "list_devices":
+                from src.audio_manager import AudioManager
 
-        elif command == "stop":
-            self._gateway.stop()
-            return {"status": "ok", "message": "Gateway stopped"}
+                with AudioManager() as manager:
+                    devices = manager.list_devices()
+                response = {"status": "ok", "data": devices}
+            elif command == "update_config":
+                config = message.get("config", {})
+                self._gateway.update_config(**config)
+                response = {"status": "ok", "message": "Config updated"}
+            elif command == "get_config":
+                response = {"status": "ok", "data": self._gateway.config.to_dict()}
+            else:
+                response = {"status": "error", "message": f"Unknown command: {command}"}
 
-        elif command == "get_status":
-            return {"status": "ok", "data": self._gateway.get_status()}
-
-        elif command == "list_devices":
-            from src.audio_manager import AudioManager
-
-            with AudioManager() as manager:
-                devices = manager.list_devices()
-            return {"status": "ok", "data": devices}
-
-        elif command == "update_config":
-            config = message.get("config", {})
-            self._gateway.update_config(**config)
-            return {"status": "ok", "message": "Config updated"}
-
-        elif command == "get_config":
-            return {"status": "ok", "data": self._gateway.config.to_dict()}
-
-        else:
-            return {"status": "error", "message": f"Unknown command: {command}"}
+            logger.debug(f"Sending response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Error handling command {command}: {e}")
+            return {"status": "error", "message": str(e)}
 
 
 class Daemon:
@@ -287,9 +282,17 @@ def main():
     parser.add_argument("--log", default="INFO", help="Log level")
     args = parser.parse_args()
 
+    log_dir = Path.home() / ".gabbie"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "gabbie.log"
+
     logging.basicConfig(
         level=getattr(logging, args.log.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(),
+        ],
     )
 
     config = Config.load(args.config)
