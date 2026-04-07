@@ -17,7 +17,7 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from src.tui.client import DaemonClient
-from src.tui.widgets import StatusIndicator
+from src.tui.widgets import AudioLevelMeter, StatusIndicator
 
 
 class DashboardScreen(Screen):
@@ -43,6 +43,7 @@ class DashboardScreen(Screen):
             with Horizontal(id="status-bar"):
                 yield Static("Gabbie Voice Gateway", id="app-title")
                 yield StatusIndicator(id="status-indicator")
+                yield AudioLevelMeter(id="audio-level-meter")
                 yield Static("", id="connection-status")
 
             # Main content area
@@ -85,17 +86,20 @@ class DashboardScreen(Screen):
         """Called when app is mounted."""
         self.title = "Gabbie Voice Gateway"
         self._connect_to_daemon()
+        self.set_interval(1.0, self._poll_events)
 
     def _connect_to_daemon(self) -> None:
         """Connect to daemon and load initial data."""
         self.client = DaemonClient()
         if self.client.connect():
             self.connected = True
+            self._log("[green]Connected to daemon[/]")
             self._load_devices()
             self._load_config()
             self._get_status()
         else:
             self.connected = False
+            self._log("[red]Not connected to daemon — start with 'gabbie daemon start'[/]")
             self.query_one("#connection-status", Static).update(
                 "[red]Not connected to daemon[/]"
             )
@@ -116,57 +120,36 @@ class DashboardScreen(Screen):
                 saved_output = config.get("output_device_index")
 
             # Load input devices
-            # Select expects (label, value) format
             input_devices = devices.get("input", [])
-            input_options = [
+            input_options = [("System Default", "default")] + [
                 (f"{d['name']} ({d['channels']}ch)", str(d["index"]))
                 for d in input_devices
             ]
 
             input_select = self.query_one("#input-device-select", Select)
-            if input_options:
-                input_select.set_options(input_options)
-                # Use saved device index, fall back to default
-                target_index = (
-                    saved_input
-                    if saved_input is not None
-                    else devices.get("default_input")
-                )
-                if target_index is not None:
-                    matching_option = next(
-                        (opt for opt in input_options if opt[1] == str(target_index)),
-                        None,
-                    )
-                    if matching_option:
-                        self.call_after_refresh(
-                            lambda: setattr(input_select, "value", matching_option[1])
-                        )
+            input_select.set_options(input_options)
+            if saved_input is not None:
+                matching = next((o for o in input_options if o[1] == str(saved_input)), None)
+                v = matching[1] if matching else "default"
+            else:
+                v = "default"
+            self.call_after_refresh(lambda s=input_select, v=v: setattr(s, "value", v))
 
             # Load output devices
             output_devices = devices.get("output", [])
-            output_options = [
+            output_options = [("System Default", "default")] + [
                 (f"{d['name']} ({d['channels']}ch)", str(d["index"]))
                 for d in output_devices
             ]
 
             output_select = self.query_one("#output-device-select", Select)
-            if output_options:
-                output_select.set_options(output_options)
-                # Use saved device index, fall back to default
-                target_index = (
-                    saved_output
-                    if saved_output is not None
-                    else devices.get("default_output")
-                )
-                if target_index is not None:
-                    matching_option = next(
-                        (opt for opt in output_options if opt[1] == str(target_index)),
-                        None,
-                    )
-                    if matching_option:
-                        self.call_after_refresh(
-                            lambda: setattr(output_select, "value", matching_option[1])
-                        )
+            output_select.set_options(output_options)
+            if saved_output is not None:
+                matching = next((o for o in output_options if o[1] == str(saved_output)), None)
+                v = matching[1] if matching else "default"
+            else:
+                v = "default"
+            self.call_after_refresh(lambda s=output_select, v=v: setattr(s, "value", v))
 
     def _load_config(self) -> None:
         """Load configuration from daemon."""
@@ -234,19 +217,52 @@ TTS Voice: {config.get("tts_voice", "N/A")}
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle device selection changes."""
+        if event.value is Select.BLANK:
+            return
+        index = None if event.value == "default" else int(event.value)
+
         if event.select.id == "input-device-select":
-            self.client.update_config(input_device_index=int(event.value))
-            self._log(f"[dim]Input device changed to {event.value}[/]")
+            self.client.update_config(input_device_index=index)
+            label = "System Default" if index is None else str(index)
+            self._log(f"[dim]Input device → {label}[/]")
 
         elif event.select.id == "output-device-select":
-            self.client.update_config(output_device_index=int(event.value))
-            self._log(f"[dim]Output device changed to {event.value}[/]")
+            self.client.update_config(output_device_index=index)
+            label = "System Default" if index is None else str(index)
+            self._log(f"[dim]Output device → {label}[/]")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Handle server URL changes."""
         if event.input.id == "server-url-input":
             self.client.update_config(server_url=event.value)
             self._log(f"[dim]Server URL updated[/]")
+
+    def _poll_events(self) -> None:
+        """Poll daemon for gateway events and display them."""
+        if not self.connected:
+            return
+        response = self.client.get_events()
+        if not response or response.get("status") != "ok":
+            return
+        for event in response.get("data", []):
+            event_type = event.get("type")
+            data = event.get("data", {})
+            if event_type == "wake_word_detected":
+                self._log(f"[yellow]⚡ Wake word detected (confidence: {data.get('confidence', 0):.2f})[/]")
+            elif event_type == "transcription":
+                self._log(f"[cyan]You: {data.get('text', '')}[/]")
+            elif event_type == "llm_response":
+                self._log(f"[green]Gabbie: {data.get('text', '')}[/]")
+            elif event_type == "tts_generated":
+                self._log(f"[dim]TTS: {data.get('length', 0)} bytes[/]")
+            elif event_type == "state_change":
+                self.gateway_state = data.get("state", "")
+                self._update_status_indicator()
+                self._log(f"[dim]→ {self.gateway_state}[/]")
+            elif event_type == "audio_level":
+                self.query_one("#audio-level-meter", AudioLevelMeter).level = data.get("level", 0.0)
+            elif event_type == "error":
+                self._log(f"[red]Error: {data.get('message', '')}[/]")
 
     def _log(self, message: str) -> None:
         """Add message to activity log."""
@@ -345,43 +361,31 @@ class SettingsScreen(Screen):
         with Vertical(id="settings-container"):
             yield Static("SETTINGS", classes="panel-title")
 
-            with Grid(id="settings-grid"):
-                # Wake word settings
-                yield Static("WAKE WORD MODEL", classes="panel-title")
-                yield Input(
-                    value="alexa", placeholder="Wake word model", id="wake-word-input"
-                )
+            with Vertical(id="settings-fields"):
+                yield Static("WAKE WORD MODEL", classes="field-label")
+                yield Input(placeholder="Wake word model", id="wake-word-input")
 
-                yield Static("DETECTION THRESHOLD", classes="panel-title")
-                yield Input(value="0.5", placeholder="0.0 - 1.0", id="threshold-input")
+                yield Static("DETECTION THRESHOLD", classes="field-label")
+                yield Input(placeholder="0.0 - 1.0", id="threshold-input")
 
-                yield Static("VAD THRESHOLD", classes="panel-title")
-                yield Input(value="0.5", placeholder="0.0 - 1.0", id="vad-input")
+                yield Static("VAD THRESHOLD", classes="field-label")
+                yield Input(placeholder="0.0 - 1.0", id="vad-input")
 
-                # Server settings
-                yield Static("STT MODEL", classes="panel-title")
-                yield Input(
-                    value="Whisper-Tiny", placeholder="STT model", id="stt-input"
-                )
+                yield Static("STT MODEL", classes="field-label")
+                yield Input(placeholder="STT model", id="stt-input")
 
-                yield Static("LLM MODEL", classes="panel-title")
-                yield Input(
-                    value="Qwen3.5-122B-A10B-GGUF",
-                    placeholder="LLM model",
-                    id="llm-input",
-                )
+                yield Static("LLM MODEL", classes="field-label")
+                yield Input(placeholder="LLM model", id="llm-input")
 
-                yield Static("TTS MODEL", classes="panel-title")
-                yield Input(value="kokoro-v1", placeholder="TTS model", id="tts-input")
+                yield Static("TTS MODEL", classes="field-label")
+                yield Input(placeholder="TTS model", id="tts-input")
 
-                yield Static("TTS VOICE", classes="panel-title")
-                yield Input(
-                    value="af_bella", placeholder="TTS voice", id="tts-voice-input"
-                )
+                yield Static("TTS VOICE", classes="field-label")
+                yield Input(placeholder="TTS voice", id="tts-voice-input")
 
-                with Horizontal(id="settings-buttons"):
-                    yield Button("Save", id="save-settings-btn", variant="primary")
-                    yield Button("Cancel", id="cancel-settings-btn", variant="default")
+            with Horizontal(id="settings-buttons"):
+                yield Button("Save", id="save-settings-btn", variant="primary")
+                yield Button("Cancel", id="cancel-settings-btn", variant="default")
 
         yield Footer()
 

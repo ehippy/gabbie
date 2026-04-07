@@ -47,10 +47,6 @@ class DaemonIPCServer:
 
         logger.info(f"IPC server started on {self.socket_path}")
 
-        # Start event forwarding thread
-        self._event_thread = threading.Thread(target=self._forward_events, daemon=True)
-        self._event_thread.start()
-
         # Accept clients
         while self._running:
             try:
@@ -96,17 +92,6 @@ class DaemonIPCServer:
                 pass
 
         logger.info("IPC server stopped")
-
-    def _forward_events(self) -> None:
-        """Forward gateway events to all connected clients."""
-        # Event broadcasting disabled to avoid interfering with command/response flow
-        # Events can be re-enabled when TUI client properly handles them
-        while self._running:
-            try:
-                self._gateway.get_event(block=False)
-                time.sleep(0.05)
-            except Exception:
-                continue
 
     def _broadcast(self, message: dict) -> None:
         """Broadcast message to all connected clients."""
@@ -186,6 +171,18 @@ class DaemonIPCServer:
                 response = {"status": "ok", "message": "Config updated"}
             elif command == "get_config":
                 response = {"status": "ok", "data": self._gateway.config.to_dict()}
+            elif command == "get_events":
+                events = []
+                while True:
+                    event = self._gateway.get_event(block=False)
+                    if event is None:
+                        break
+                    events.append({
+                        "type": event.event_type,
+                        "data": event.data,
+                        "timestamp": event.timestamp,
+                    })
+                response = {"status": "ok", "data": events}
             else:
                 response = {"status": "error", "message": f"Unknown command: {command}"}
 

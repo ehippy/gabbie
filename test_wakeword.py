@@ -33,7 +33,7 @@ def main():
     try:
         device_info = p.get_device_info_by_index(device_index)
         print(f"\nUsing device: {device_info['name']}")
-    except:
+    except OSError:
         print(f"\nDevice {device_index} not found, using default")
         device_index = p.get_default_input_device_info()["index"]
 

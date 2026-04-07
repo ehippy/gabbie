@@ -21,7 +21,7 @@ class Config:
 
     # Wake word settings
     wake_word: str = "alexa"
-    detection_threshold: float = 0.1
+    detection_threshold: float = 0.5
     vad_threshold: float = 0.5
 
     # Recording settings

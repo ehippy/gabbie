@@ -289,19 +289,33 @@ def restart():
 @app.command()
 def tui():
     """Launch the TUI interface."""
-    if not is_daemon_running():
-        typer.echo("Daemon not running. Starting daemon...")
-        log_dir = Path.home() / ".gabbie"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "gabbie.log"
-        cmd = [sys.executable, "-m", "src.daemon", "--log", "DEBUG"]
-        process = subprocess.Popen(
-            cmd,
-            stdout=log_file.open("a"),
-            stderr=log_file.open("a"),
-            start_new_session=True,
-        )
-        time.sleep(1)
+    # Always restart daemon so TUI picks up the latest code
+    if is_daemon_running():
+        pid_file = get_pid_file()
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                if not os.path.exists(pid_file):
+                    break
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+    log_dir = Path.home() / ".gabbie"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "gabbie.log"
+    cmd = [sys.executable, "-m", "src.daemon", "--log", "DEBUG"]
+    log_fh = log_file.open("a")
+    process = subprocess.Popen(
+        cmd,
+        stdout=log_fh,
+        stderr=log_fh,
+        start_new_session=True,
+    )
+    log_fh.close()
+    time.sleep(1)
 
     from src.tui.app import main as tui_main
 

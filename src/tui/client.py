@@ -128,6 +128,10 @@ class DaemonClient:
         """Get current configuration."""
         return self.send_command("get_config")
 
+    def get_events(self) -> dict[str, Any] | None:
+        """Drain pending gateway events."""
+        return self.send_command("get_events")
+
     def __enter__(self):
         self.connect()
         return self

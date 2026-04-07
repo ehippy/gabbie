@@ -4,6 +4,7 @@ import io
 import logging
 import queue
 import struct
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -63,6 +64,9 @@ class VoiceGatewayService:
         self._session = requests.Session()
         self._session.timeout = 30
         self._conversation_history: list[dict[str, Any]] = []
+        self._last_confidence: float = 0.0
+        self._wake_word_key: str = ""
+        self._audio_level_frame_count: int = 0
 
     @property
     def state(self) -> GatewayState:
@@ -155,7 +159,9 @@ class VoiceGatewayService:
             enable_speex_noise_suppression=False,
             vad_threshold=self.config.vad_threshold,
         )
-        logger.info("Wake word model loaded successfully")
+        # Store the actual key used in predictions (filename stem, e.g. "alexa_v0.1")
+        self._wake_word_key = next(iter(self._wake_model.models.keys()))
+        logger.info(f"Wake word model loaded, prediction key: {self._wake_word_key}")
 
     def _start_audio_stream(self) -> None:
         """Start the audio input stream."""
@@ -197,17 +203,20 @@ class VoiceGatewayService:
         if status:
             logger.debug(f"Audio stream status: {status}")
         self._audio_queue.put(in_data)
-        if logger.isEnabledFor(logging.DEBUG):
-            # Log first few seconds of audio data to verify stream is working
-            non_zero = sum(1 for b in in_data if b != 0)
-            logger.debug(
-                f"Audio callback: {frame_count} frames, {non_zero}/{len(in_data) // 2} non-zero samples"
-            )
+        self._audio_level_frame_count += 1
+        if self._audio_level_frame_count >= 10:
+            self._audio_level_frame_count = 0
+            audio_array = np.frombuffer(in_data, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(audio_array.astype(np.float32) ** 2)) / 32768.0)
+            self._push_event("audio_level", {"level": rms})
         return (None, pyaudio.paContinue)
 
     def _audio_loop(self) -> None:
         """Main audio processing loop for wake word detection."""
-        while self._running and self._state == GatewayState.LISTENING:
+        while self._running:
+            if self._state != GatewayState.LISTENING:
+                time.sleep(0.05)
+                continue
             try:
                 audio_data = self._audio_queue.get(timeout=0.1)
                 if self._wake_model:
@@ -215,6 +224,7 @@ class VoiceGatewayService:
                     if logger.isEnabledFor(logging.DEBUG) and confidence > 0.1:
                         logger.debug(f"Wake word check: confidence = {confidence:.4f}")
                     if confidence:
+                        self._wake_model.reset()
                         self._set_state(GatewayState.DETECTED)
                         self._push_event(
                             "wake_word_detected", {"confidence": self._last_confidence}
@@ -240,10 +250,10 @@ class VoiceGatewayService:
                     if score > 0.01:
                         logger.debug(f"Wake word '{word}': {score:.4f}")
 
-        if predictions and self.config.wake_word in predictions:
-            score = predictions[self.config.wake_word]
+        if predictions and self._wake_word_key in predictions:
+            score = predictions[self._wake_word_key]
             if score >= self.config.detection_threshold:
-                self._last_confidence = score
+                self._last_confidence = float(score)
                 return True
         return False
 
@@ -261,8 +271,12 @@ class VoiceGatewayService:
         silence_start = None
         start_time = time.time()
 
-        # Drain audio queue for a bit to get post-wake audio
-        time.sleep(0.2)
+        # Discard audio that built up in the queue during wake word detection
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
         while (
             self._running
@@ -292,7 +306,7 @@ class VoiceGatewayService:
 
         audio_bytes = b"".join(frames)
         logger.info(
-            f"Recorded {len(audio_bytes)} bytes ({len(audio_bytes) / self.config.sample_rate:.1f}s)"
+            f"Recorded {len(audio_bytes)} bytes ({len(audio_bytes) / 2 / self.config.sample_rate:.1f}s)"
         )
 
         if len(audio_bytes) >= 1000:
@@ -308,8 +322,8 @@ class VoiceGatewayService:
         try:
             # STT
             text = self._transcribe(audio_data)
-            if not text:
-                logger.warning("Empty transcription")
+            if not text or text.startswith("["):
+                logger.warning(f"Skipping transcription: '{text}'")
                 self._set_state(GatewayState.LISTENING)
                 return
 
@@ -342,11 +356,17 @@ class VoiceGatewayService:
             self._play_audio(response_audio)
             self._push_event("playback_complete", {})
 
-            self._set_state(GatewayState.LISTENING)
-
         except Exception as e:
             logger.error(f"Error processing utterance: {e}")
             self._push_event("error", {"message": str(e)})
+
+        finally:
+            # Discard audio captured during processing/playback before listening again
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    break
             self._set_state(GatewayState.LISTENING)
 
     def _transcribe(self, audio_data: bytes) -> str:
@@ -426,7 +446,8 @@ class VoiceGatewayService:
             try:
                 response = self._session.post(url, json=payload)
                 response.raise_for_status()
-                logger.info(f"TTS: {len(response.content)} bytes")
+                content_type = response.headers.get("content-type", "unknown")
+                logger.info(f"TTS: {len(response.content)} bytes, content-type: {content_type}")
                 return response.content
             except requests.exceptions.RequestException as e:
                 logger.warning(f"TTS attempt {attempt + 1} failed: {e}")
@@ -438,28 +459,24 @@ class VoiceGatewayService:
         return b""
 
     def _play_audio(self, audio_data: bytes) -> None:
-        """Play audio through speakers."""
+        """Play audio through speakers via ffplay."""
         try:
-            paudio = pyaudio.PyAudio()
-
-            kwargs = {
-                "format": pyaudio.paInt16,
-                "channels": self.config.channels,
-                "rate": self.config.sample_rate,
-                "output": True,
-            }
-
-            if self.config.output_device_index is not None:
-                kwargs["output_device_index"] = self.config.output_device_index
-
-            stream = paudio.open(**kwargs)
-            stream.write(audio_data)
-            stream.stop_stream()
-            stream.close()
-            paudio.terminate()
-            logger.info("Audio playback complete")
+            proc = subprocess.run(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+                input=audio_data,
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode().strip())
+            logger.info(f"Playback complete ({len(audio_data)} bytes)")
+        except FileNotFoundError:
+            msg = "ffplay not found — install ffmpeg"
+            logger.error(msg)
+            self._push_event("error", {"message": msg})
         except Exception as e:
-            logger.error(f"Failed to play audio: {e}")
+            msg = f"Playback failed: {e}"
+            logger.error(msg)
+            self._push_event("error", {"message": msg})
 
     def _create_wav_header(self, data_size: int) -> bytes:
         """Create WAV file header."""

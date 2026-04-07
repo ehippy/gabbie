@@ -19,7 +19,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -61,8 +60,14 @@ Screen {
     margin-left: 2;
 }
 
+#audio-level-meter {
+    width: 14;
+    content-align: center middle;
+    margin-left: 2;
+}
+
 #connection-status {
-    width: 100%;
+    width: 1fr;
     content-align: right middle;
     margin-left: 2;
 }
@@ -80,6 +85,7 @@ Screen {
     padding: 1;
     background: $surface;
     border: solid $primary;
+    overflow-y: auto;
 }
 
 #log-panel {
@@ -124,7 +130,7 @@ Input {
 }
 
 #activity-log {
-    height: -1;
+    height: 1fr;
     background: $panel;
     border: tall $primary;
     padding: 0 1;
@@ -147,14 +153,20 @@ Input {
     height: 100%;
 }
 
-#settings-grid {
+#settings-fields {
     height: auto;
-    grid-size: 2;
-    grid-columns: 30fr 70fr;
+    overflow-y: auto;
+}
+
+.field-label {
+    color: $primary;
+    margin-top: 1;
+    height: 1;
 }
 
 #settings-buttons {
     width: 100%;
+    height: auto;
     margin-top: 2;
 }
 
