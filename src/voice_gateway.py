@@ -400,7 +400,7 @@ class VoiceGatewayService:
 
     def _get_llm_response(self, text: str) -> str:
         """Get LLM response for text."""
-        url = f"{self.config.server_url}/chat/completions"
+        url = f"{self.config.llm_url}/chat/completions"
 
         payload = {
             "model": self.config.llm_model,

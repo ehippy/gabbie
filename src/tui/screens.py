@@ -371,6 +371,9 @@ class SettingsScreen(Screen):
                 yield Static("VAD THRESHOLD", classes="field-label")
                 yield Input(placeholder="0.0 - 1.0", id="vad-input")
 
+                yield Static("LLM URL", classes="field-label")
+                yield Input(placeholder="http://host:port/v1", id="llm-url-input")
+
                 yield Static("STT MODEL", classes="field-label")
                 yield Input(placeholder="STT model", id="stt-input")
 
@@ -411,6 +414,9 @@ class SettingsScreen(Screen):
                 self.query_one("#vad-input", Input).value = str(
                     config.get("vad_threshold", 0.5)
                 )
+                self.query_one("#llm-url-input", Input).value = config.get(
+                    "llm_url", "http://neuralforge:8000/v1"
+                )
                 self.query_one("#stt-input", Input).value = config.get(
                     "stt_model", "Whisper-Tiny"
                 )
@@ -442,6 +448,7 @@ class SettingsScreen(Screen):
                     self.query_one("#threshold-input", Input).value
                 ),
                 "vad_threshold": float(self.query_one("#vad-input", Input).value),
+                "llm_url": self.query_one("#llm-url-input", Input).value,
                 "stt_model": self.query_one("#stt-input", Input).value,
                 "llm_model": self.query_one("#llm-input", Input).value,
                 "tts_model": self.query_one("#tts-input", Input).value,

@@ -31,6 +31,7 @@ class Config:
 
     # Server settings
     server_url: str = "http://neuralforge:8000/api/v1"
+    llm_url: str = "http://neuralforge:8000/v1"
     tts_model: str = "kokoro-v1"
     tts_voice: str = "af_bella"
     stt_model: str = "Whisper-Tiny"
@@ -69,9 +70,8 @@ class Config:
             post_wake_buffer=data.get("recording", {}).get("post_wake_buffer", 3),
             silence_threshold=data.get("recording", {}).get("silence_threshold", 0.01),
             silence_duration=data.get("recording", {}).get("silence_duration", 0.5),
-            server_url=data.get("server", {}).get(
-                "url", "http://neuralforge:8000/api/v1"
-            ),
+            server_url=data.get("server", {}).get("url", "http://neuralforge:8000/api/v1"),
+            llm_url=data.get("server", {}).get("llm_url", "http://neuralforge:8000/v1"),
             tts_model=data.get("server", {}).get("tts_model", "kokoro-v1"),
             tts_voice=data.get("server", {}).get("tts_voice", "af_bella"),
             stt_model=data.get("server", {}).get("stt_model", "Whisper-Tiny"),
@@ -106,6 +106,7 @@ class Config:
             },
             "server": {
                 "url": self.server_url,
+                "llm_url": self.llm_url,
                 "tts_model": self.tts_model,
                 "tts_voice": self.tts_voice,
                 "stt_model": self.stt_model,
@@ -140,6 +141,7 @@ class Config:
             "silence_threshold": self.silence_threshold,
             "silence_duration": self.silence_duration,
             "server_url": self.server_url,
+            "llm_url": self.llm_url,
             "tts_model": self.tts_model,
             "tts_voice": self.tts_voice,
             "stt_model": self.stt_model,
@@ -164,6 +166,7 @@ class Config:
             silence_threshold=data.get("silence_threshold", 0.01),
             silence_duration=data.get("silence_duration", 0.5),
             server_url=data.get("server_url", "http://neuralforge:8000/api/v1"),
+            llm_url=data.get("llm_url", "http://neuralforge:8000/v1"),
             tts_model=data.get("tts_model", "kokoro-v1"),
             tts_voice=data.get("tts_voice", "af_bella"),
             stt_model=data.get("stt_model", "Whisper-Tiny"),
