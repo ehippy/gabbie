@@ -1,16 +1,15 @@
-#!/usr/bin/env python3
-"""
-Gabbie - Voice Gateway for Raspberry Pi 3
+from kittentts import KittenTTS
+import soundfile as sf
 
-Entry point for CLI. Use:
-  gabbie          - Launch TUI (auto-starts daemon)
-  gabbie daemon   - Daemon management
-  gabbie tui      - Launch TUI only
-  gabbie config   - Configuration management
-  gabbie devices  - List audio devices
-"""
 
-from src.cli import run
+def main():
+    model = KittenTTS("KittenML/kitten-tts-mini-0.8")
+    audio = model.generate(
+        "This high quality TTS model works without a GPU", voice="Jasper"
+    )
+    sf.write("output.wav", audio, 24000)
+    print("Wrote output.wav")
+
 
 if __name__ == "__main__":
-    run()
+    main()
