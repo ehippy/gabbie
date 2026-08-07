@@ -531,7 +531,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kittentts", url = "https://github.com/KittenML/KittenTTS/releases/download/0.8/kittentts-0.8.0-py3-none-any.whl" },
+    { name = "kittentts", path = "vendor/kittentts-0.8.0-py3-none-any.whl" },
     { name = "soundfile", specifier = ">=0.14.0" },
 ]
 
@@ -684,8 +684,8 @@ wheels = [
 
 [[package]]
 name = "kittentts"
-version = "0.1.0"
-source = { url = "https://github.com/KittenML/KittenTTS/releases/download/0.8/kittentts-0.8.0-py3-none-any.whl" }
+version = "0.8.0"
+source = { path = "vendor/kittentts-0.8.0-py3-none-any.whl" }
 dependencies = [
     { name = "espeakng-loader" },
     { name = "huggingface-hub" },
@@ -697,7 +697,7 @@ dependencies = [
     { name = "spacy" },
 ]
 wheels = [
-    { url = "https://github.com/KittenML/KittenTTS/releases/download/0.8/kittentts-0.8.0-py3-none-any.whl", hash = "sha256:cba97464da2ec56384b9fc03004449dadbe6d9abd16aa89e98953027854fd7d9" },
+    { filename = "kittentts-0.8.0-py3-none-any.whl", hash = "sha256:253ac4f28909308dc04e1323ce39a00b3ba3c7be7c070adf7632293d7970db5d" },
 ]
 
 [package.metadata]
