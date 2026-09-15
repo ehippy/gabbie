@@ -18,6 +18,8 @@ import sounddevice as sd
 import soundfile as sf
 import webrtcvad
 
+from eventbus import EventBus
+
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
@@ -44,9 +46,10 @@ SYSTEM_PROMPT = (
     "when the user explicitly asks for detail, a list, or an explanation. "
     "Being brief does NOT mean sounding cold, flat, or robotic - stay warm "
     "and playful even in a one-word reply. When the user shares something "
-    "personal or new about themselves, acknowledge it warmly and briefly "
-    "('Got it, 1982 - noted!') rather than a flat, clinical 'Noted' or "
-    "'Fair'. You do have long-term memory: important facts get saved "
+    "personal or new about themselves, warmly acknowledge THAT SPECIFIC "
+    "thing in your own words, briefly - never a flat, clinical 'Noted' or "
+    "'Fair', and never a stock phrase or an unrelated fact from earlier in "
+    "the conversation. You do have long-term memory: important facts get saved "
     "automatically and recalled in future conversations. If you don't know "
     "something about the user yet, say so plainly rather than claiming you "
     "have no memory at all."
@@ -214,7 +217,7 @@ def extract_memory_updates(client, current_facts, recent_messages):
         return [], []
 
 
-def remember_worker(client, memory_lock, recent_messages):
+def remember_worker(client, memory_lock, events, recent_messages):
     with memory_lock:
         current_facts = [f["fact"] for f in load_memory()]
     add, remove = extract_memory_updates(client, current_facts, recent_messages)
@@ -227,6 +230,7 @@ def remember_worker(client, memory_lock, recent_messages):
             for f in existing:
                 if f["fact"] in remove_set:
                     log(f"[forgot] {f['fact']}")
+                    events.publish("forgot", fact=f["fact"])
             existing = [f for f in existing if f["fact"] not in remove_set]
         known = {f["fact"] for f in existing}
         for fact in add:
@@ -234,14 +238,16 @@ def remember_worker(client, memory_lock, recent_messages):
                 existing.append({"fact": fact, "ts": datetime.now().isoformat()})
                 known.add(fact)
                 log(f"[remembered] {fact}")
+                events.publish("remembered", fact=fact)
         MEMORY_PATH.write_text(json.dumps(existing, indent=2))
 
 
-def speak(client, listening_enabled, audio_queue, text):
+def speak(client, listening_enabled, audio_queue, events, text):
     """Speak a short, fixed line (no streaming needed)."""
     listening_enabled.clear()
     drain_queue(audio_queue)
     try:
+        events.publish("speaking", text=text)
         audio, sr = synthesize(client, text)
         sd.play(audio, sr)
         sd.wait()
@@ -251,7 +257,7 @@ def speak(client, listening_enabled, audio_queue, text):
         listening_enabled.set()
 
 
-def think_and_speak(client, listening_enabled, audio_queue, messages):
+def think_and_speak(client, listening_enabled, audio_queue, events, messages):
     """Stream the LLM reply, synthesizing and playing each sentence as soon
     as it's complete instead of waiting for the whole reply. Returns the
     full reply text once everything has finished playing."""
@@ -335,8 +341,10 @@ def think_and_speak(client, listening_enabled, audio_queue, messages):
             if first_clip_at is None:
                 first_clip_at = time.time()
                 log(f"[first audio after {first_clip_at - t0:.1f}s]")
+                events.publish("first_audio", seconds=round(first_clip_at - t0, 1))
             sentence, audio, sr = clip
             log(f"Gabbie: {sentence}")
+            events.publish("speaking", text=sentence)
             sd.play(audio, sr)
             sd.wait()
 
@@ -345,12 +353,14 @@ def think_and_speak(client, listening_enabled, audio_queue, messages):
             # silence and wondering if she heard them at all.
             fallback = "Sorry, could you say that again?"
             log(f"Gabbie: {fallback}  [fallback after empty reply]")
+            events.publish("speaking", text=fallback)
             audio, sr = synthesize(client, fallback)
             sd.play(audio, sr)
             sd.wait()
             full_text["reply"] = fallback
 
         time.sleep(PLAYBACK_COOLDOWN_SECONDS)
+        events.publish("done_speaking", text=full_text.get("reply", ""))
         return full_text.get("reply", "")
     finally:
         drain_queue(audio_queue)
@@ -363,6 +373,12 @@ def main():
     client = OpenAI(base_url=NEURALFORGE_URL, api_key="not-needed")
     vad = webrtcvad.Vad(VAD_MODE)
     memory_lock = threading.Lock()
+
+    events = EventBus()
+    if events.start():
+        log(f"[events broadcasting on {events.host}:{events.port}]")
+    else:
+        log("[event port unavailable, running without event broadcast]")
 
     audio_queue = queue.Queue()
     listening_enabled = threading.Event()
@@ -387,7 +403,7 @@ def main():
         context = messages[last_extracted_index:]
         last_extracted_index = len(messages)
         remember_thread = threading.Thread(
-            target=remember_worker, args=(client, memory_lock, context), daemon=True
+            target=remember_worker, args=(client, memory_lock, events, context), daemon=True
         )
         remember_thread.start()
 
@@ -396,7 +412,7 @@ def main():
         if remember_thread:
             remember_thread.join()
         if len(messages) > last_extracted_index:
-            remember_worker(client, memory_lock, messages[last_extracted_index:])
+            remember_worker(client, memory_lock, events, messages[last_extracted_index:])
             last_extracted_index = len(messages)
 
     stream = sd.InputStream(
@@ -411,11 +427,13 @@ def main():
         try:
             while True:
                 log("[listening]")
+                events.publish("listening")
                 audio = listen_for_utterance(vad, audio_queue)
                 if audio.size < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
                     continue
 
                 log("[transcribing]")
+                events.publish("transcribing")
                 t0 = time.time()
                 text = transcribe(whisper, audio)
                 if not text:
@@ -424,20 +442,24 @@ def main():
                 already_awake = time.time() < awake_until
                 if not already_awake and not contains_wake_word(text):
                     log(f"You: {text}  ({time.time() - t0:.1f}s)  [no wake word, ignored]")
+                    events.publish("heard", text=text, ignored=True)
                     continue
                 log(f"You: {text}  ({time.time() - t0:.1f}s)" + ("" if already_awake else "  [woke up]"))
+                events.publish("heard", text=text, woke=not already_awake)
 
                 append_transcript(transcript_path, "user", text)
 
                 if GOODBYE_PATTERN.search(text):
-                    speak(client, listening_enabled, audio_queue, "Bye bye!")
+                    speak(client, listening_enabled, audio_queue, events, "Bye bye!")
                     append_transcript(transcript_path, "assistant", "Bye bye!")
                     flush_memory_sync()
+                    events.publish("bye")
                     break
 
                 if contains_sleep_phrase(text):
                     log("[going to sleep]")
-                    speak(client, listening_enabled, audio_queue, "Okay, I'll be quiet.")
+                    events.publish("sleeping")
+                    speak(client, listening_enabled, audio_queue, events, "Okay, I'll be quiet.")
                     append_transcript(transcript_path, "assistant", "Okay, I'll be quiet.")
                     awake_until = 0.0
                     # Nobody's actively waiting on anything right now, so
@@ -454,8 +476,9 @@ def main():
 
                 messages.append({"role": "user", "content": text})
                 log("[thinking + speaking]")
+                events.publish("thinking")
                 t0 = time.time()
-                reply = think_and_speak(client, listening_enabled, audio_queue, messages)
+                reply = think_and_speak(client, listening_enabled, audio_queue, events, messages)
                 # Start the awake window now that the mic is live again,
                 # rather than from when the user last spoke - otherwise a
                 # long reply (mic muted the whole time) eats into their
