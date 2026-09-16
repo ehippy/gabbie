@@ -169,11 +169,11 @@ function connectStream() {
         setStatus(evt.event);
         break;
       case "heard":
-        if (!evt.ignored) appendConversationLine("user", evt.text);
+        if (!evt.ignored) appendConversationLine("user", evt.text, evt.ts);
         break;
       case "speaking":
         setStatus("speaking");
-        appendConversationLine("assistant", evt.text);
+        appendConversationLine("assistant", evt.text, evt.ts);
         break;
       case "done_speaking":
         setStatus("listening");
@@ -201,7 +201,7 @@ function connectStream() {
 }
 
 // --- Conversation ---
-function appendConversationLine(role, text) {
+function appendConversationLine(role, text, tsIso) {
   const el = document.getElementById("live-conversation");
   const placeholder = el.querySelector(".text-secondary.small");
   if (placeholder) el.innerHTML = "";
@@ -209,12 +209,29 @@ function appendConversationLine(role, text) {
   div.className = "msg mb-2";
   const roleClass = role === "user" ? "user" : "assistant";
   const roleLabel = role === "user" ? "You" : "Gabbie";
+  const time = (tsIso ? new Date(tsIso) : new Date()).toLocaleTimeString();
   div.innerHTML = `
     <span class="role ${roleClass} fw-semibold small">${roleLabel}</span>
-    <span class="text-secondary" style="font-size: 0.75rem;">${new Date().toLocaleTimeString()}</span>
+    <span class="text-secondary" style="font-size: 0.75rem;">${time}</span>
     <div>${escapeHtml(text)}</div>`;
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
+}
+
+// Rebuilds the feed from the current session's transcript (the most
+// recent one - main.py starts a fresh file each run and appends to it
+// for the rest of that run) so a page refresh doesn't lose everything
+// said before the reload. Only covers completed turns; anything from
+// here on comes in live over the SSE stream in connectStream().
+async function hydrateConversation() {
+  const names = await fetch("/api/transcripts").then((r) => r.json());
+  if (!names.length) return;
+  const entries = await fetch("/api/transcripts/" + encodeURIComponent(names[0])).then((r) => r.json());
+  for (const entry of entries) {
+    if (entry.role === "user" || entry.role === "assistant") {
+      appendConversationLine(entry.role, entry.content, entry.ts);
+    }
+  }
 }
 
 // --- Mood ---
@@ -468,7 +485,10 @@ lightboxEl.addEventListener("keydown", (e) => {
   else if (e.key === "ArrowRight") stepLightbox(1);
 });
 
-connectStream();
+// Hydrate before opening the live stream, so a "heard"/"speaking" event
+// that arrives moments after connecting can't render above history that
+// hasn't loaded yet.
+hydrateConversation().then(connectStream);
 loadMemory();
 loadMood();
 loadTranscriptList();
