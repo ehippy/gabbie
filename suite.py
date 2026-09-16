@@ -1,9 +1,9 @@
-"""Launches main.py, avatar.py, and dashboard.py together and manages them
-as one unit - press Ctrl+C once to stop all three cleanly.
+"""Launches main.py and dashboard.py together and manages them as one unit
+- press Ctrl+C once to stop both cleanly.
 
 Each one still runs standalone too (`uv run main.py` on its own works
-fine, and avatar.py/dashboard.py reconnect automatically if Gabbie isn't
-up yet) - this is just a convenience for running the whole suite at once.
+fine, and dashboard.py reconnects automatically if Gabbie isn't up yet) -
+this is just a convenience for running both at once.
 """
 
 import signal
@@ -16,7 +16,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 PROCESSES = [
     ("main", "main.py"),
-    ("avatar", "avatar.py"),
     ("dashboard", "dashboard.py"),
 ]
 SHUTDOWN_TIMEOUT_SECONDS = 5

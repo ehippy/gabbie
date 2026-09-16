@@ -1,7 +1,7 @@
 """Broadcasts Gabbie's state as JSON-lines events to any connected process
-(an avatar, a dashboard, whatever) over a local TCP socket. Optional side
-channel - if nothing's listening, or the port's unavailable, Gabbie still
-runs fine without it.
+(the dashboard, or whatever else wants to watch) over a local TCP socket.
+Optional side channel - if nothing's listening, or the port's unavailable,
+Gabbie still runs fine without it.
 """
 
 import json

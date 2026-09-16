@@ -7,7 +7,6 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
     "openai>=3.14.0",
-    "pygame>=2.6.1",
     "setuptools<81",
     "sounddevice>=0.4.7",
     "soundfile>=0.14.0",
