@@ -12,6 +12,7 @@ import queue
 import socket
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -70,6 +71,20 @@ def remove_fact(ts):
     if removed:
         MEMORY_PATH.write_text(json.dumps(remaining, indent=2))
     return removed
+
+
+def update_fact(ts, new_text):
+    facts = load_memory()
+    for f in facts:
+        if f.get("ts") == ts:
+            f["fact"] = new_text
+            # Bumped like a voice-driven edit_memory - an edit counts as
+            # freshly touched, and it keeps this a stable per-fact id even
+            # though ts doubles as one.
+            f["ts"] = datetime.now().isoformat()
+            MEMORY_PATH.write_text(json.dumps(facts, indent=2))
+            return f["ts"]
+    return None
 
 
 def list_available_models():
@@ -196,6 +211,29 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/memory/"):
             ts = unquote(path[len("/api/memory/") :])
             self._send_json({"removed": remove_fact(ts)})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/memory/"):
+            ts = unquote(path[len("/api/memory/") :])
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+            fact = body.get("fact")
+            if not isinstance(fact, str) or not fact.strip():
+                self._send_json({"error": "fact must be a non-empty string"}, status=400)
+                return
+            new_ts = update_fact(ts, fact.strip())
+            if new_ts is None:
+                self._send_json({"error": "not found"}, status=404)
+                return
+            self._send_json({"ok": True, "ts": new_ts})
             return
         self.send_response(404)
         self.end_headers()

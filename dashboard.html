@@ -427,22 +427,65 @@ async function loadMemory() {
   el.innerHTML = "";
   for (const f of facts) {
     const row = document.createElement("div");
-    row.className = "list-group-item d-flex justify-content-between align-items-start gap-2";
-    row.innerHTML = `
-      <div>
-        <div>${escapeHtml(f.fact)}</div>
-        <div class="text-secondary" style="font-size: 0.75rem;">${f.ts || ""}</div>
-      </div>`;
-    const btn = document.createElement("button");
-    btn.className = "btn btn-sm btn-outline-danger flex-shrink-0";
-    btn.textContent = "forget";
-    btn.onclick = async () => {
-      await fetch("/api/memory/" + encodeURIComponent(f.ts), { method: "DELETE" });
-      loadMemory();
-    };
-    row.appendChild(btn);
+    row.className = "list-group-item";
+    renderMemoryRow(row, f);
     el.appendChild(row);
   }
+}
+
+function renderMemoryRow(row, f) {
+  row.innerHTML = `
+    <div class="d-flex justify-content-between align-items-start gap-2">
+      <div class="flex-grow-1">
+        <div>${escapeHtml(f.fact)}</div>
+        <div class="text-secondary" style="font-size: 0.75rem;">${f.ts || ""}</div>
+      </div>
+      <div class="d-flex gap-1 flex-shrink-0">
+        <button type="button" class="btn btn-sm btn-outline-secondary edit-fact-btn">edit</button>
+        <button type="button" class="btn btn-sm btn-outline-danger forget-fact-btn">forget</button>
+      </div>
+    </div>`;
+  row.querySelector(".edit-fact-btn").onclick = () => renderMemoryEditRow(row, f);
+  row.querySelector(".forget-fact-btn").onclick = async () => {
+    await fetch("/api/memory/" + encodeURIComponent(f.ts), { method: "DELETE" });
+    loadMemory();
+  };
+}
+
+function renderMemoryEditRow(row, f) {
+  row.innerHTML = `
+    <textarea class="form-control form-control-sm mb-2" rows="2">${escapeHtml(f.fact)}</textarea>
+    <div class="d-flex gap-1 justify-content-end">
+      <button type="button" class="btn btn-sm btn-secondary cancel-edit-btn">Cancel</button>
+      <button type="button" class="btn btn-sm btn-primary save-edit-btn">Save</button>
+    </div>`;
+  const textarea = row.querySelector("textarea");
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+  const save = async () => {
+    const newFact = textarea.value.trim();
+    if (!newFact || newFact === f.fact) {
+      renderMemoryRow(row, f);
+      return;
+    }
+    const res = await fetch("/api/memory/" + encodeURIComponent(f.ts), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fact: newFact }),
+    });
+    if (res.ok) {
+      loadMemory();
+    } else {
+      alert("Couldn't save that edit - try again.");
+    }
+  };
+  textarea.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save();
+    else if (e.key === "Escape") renderMemoryRow(row, f);
+  });
+  row.querySelector(".cancel-edit-btn").onclick = () => renderMemoryRow(row, f);
+  row.querySelector(".save-edit-btn").onclick = save;
 }
 
 // --- Transcripts ---
