@@ -217,7 +217,11 @@ def extract_memory_updates(client, current_facts, recent_messages):
     convo = "\n".join(
         f"{'User' if m['role'] == 'user' else 'Gabbie'}: {m['content']}"
         for m in recent_messages
-        if m["role"] in ("user", "assistant")
+        # A tool-calling turn's assistant message often has content=None
+        # (the model went straight for the tool with nothing to say first)
+        # - skip those rather than feeding the extractor literal "Gabbie:
+        # None" lines.
+        if m["role"] in ("user", "assistant") and m.get("content")
     )
     current_block = "\n".join(f"- {f}" for f in current_facts) or "(none yet)"
     user_content = f"Current known facts:\n{current_block}\n\nRecent conversation:\n{convo}"
@@ -662,6 +666,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
             # test: 5/10 suspect replies at temp=1.0 vs 0/10 at temp=0.6,
             # personality intact. Overriding it here for reliability.
             empty_retries_left = 2
+            filler_spoken = False
             for _round in range(MAX_TOOL_ROUNDS + 2):
                 parts = []
                 buffer = ""
@@ -718,8 +723,9 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                 full_reply = re.sub(r"<think>.*$", "", full_reply, flags=re.DOTALL).strip()
 
                 if tool_calls:
-                    if not full_reply:
+                    if not full_reply and not filler_spoken:
                         sentence_queue.put(random.choice(TOOL_FILLER_PHRASES))
+                        filler_spoken = True
                     ordered = [tool_calls[i] for i in sorted(tool_calls)]
                     messages.append(
                         {
@@ -747,9 +753,15 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                             # must happen on the thread that owns audio
                             # playback - not here (this is a background
                             # thread) - so hand it to the draining loop
-                            # below and block for its answer.
+                            # below and block for its answer. Routed through
+                            # sentence_queue (not put on clip_queue directly)
+                            # so tts_worker stays the sole producer into
+                            # clip_queue - otherwise this, being near-instant,
+                            # can race ahead of a still-synthesizing filler
+                            # phrase queued moments earlier and get spoken
+                            # (and confirmed/acted on) before it.
                             response_box = queue.Queue(maxsize=1)
-                            clip_queue.put(("confirm", (description, response_box)))
+                            sentence_queue.put(("confirm", description, response_box))
                             approved = response_box.get()
                             if approved:
                                 result_text, result_extra = execute_tool(c["name"], c["arguments"])
@@ -777,16 +789,31 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                     break
                 empty_retries_left -= 1
                 log("[empty reply, retrying]")
+            else:
+                # Every round kept calling tools and the loop ran out
+                # without ever reaching a final text answer - otherwise
+                # this leaves the user with dead air after the filler
+                # phrase (already spoken) and an empty turn in history.
+                log("[tool round limit hit, giving up]")
+                fallback = "Sorry, I'm having trouble finishing that - can you try again?"
+                full_text["reply"] = fallback
+                sentence_queue.put(fallback)
             sentence_queue.put(None)
 
         def tts_worker():
             while True:
-                sentence = sentence_queue.get()
-                if sentence is None:
+                item = sentence_queue.get()
+                if item is None:
                     clip_queue.put(None)
                     return
-                audio, sr = synthesize(client, sentence)
-                clip_queue.put(("clip", (sentence, audio, sr)))
+                if isinstance(item, tuple):
+                    # Confirmation request, not a sentence to synthesize -
+                    # just forward it in place so it stays ordered relative
+                    # to any sentence queued ahead of it.
+                    clip_queue.put(("confirm", item[1:]))
+                    continue
+                audio, sr = synthesize(client, item)
+                clip_queue.put(("clip", (item, audio, sr)))
 
         threading.Thread(target=llm_worker, daemon=True).start()
         threading.Thread(target=tts_worker, daemon=True).start()
