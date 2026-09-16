@@ -547,6 +547,10 @@ def tool_web_search(query=None, **_kwargs):
     return "\n".join(lines), {"query": query, "results": structured}
 
 
+MAX_IMAGE_RESULTS = 20
+MIN_IMAGE_DIMENSION = 400  # px, on the shorter side - filters out icons/logos/tiny thumbnails
+
+
 def tool_image_search(query=None, **_kwargs):
     if not query:
         return "Error: no query given"
@@ -555,7 +559,11 @@ def tool_image_search(query=None, **_kwargs):
     try:
         response = httpx.get(
             BRAVE_IMAGE_SEARCH_URL,
-            params={"q": query, "count": 20},
+            # Brave doesn't offer a server-side size filter, so over-fetch
+            # (its max) and filter by actual source dimensions below -
+            # otherwise a query dominated by small icons/logos could come
+            # back mostly filtered out.
+            params={"q": query, "count": 50},
             headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
             timeout=10,
         )
@@ -565,10 +573,14 @@ def tool_image_search(query=None, **_kwargs):
         return f"Error: image search returned HTTP {response.status_code}"
     results = response.json().get("results", [])
     structured = []
-    for r in results[:20]:
+    for r in results:
         thumbnail = r.get("thumbnail", {}).get("src")
         if not thumbnail:
             continue  # nothing to show for this one, skip it
+        properties = r.get("properties", {})
+        width, height = properties.get("width", 0), properties.get("height", 0)
+        if min(width, height) < MIN_IMAGE_DIMENSION:
+            continue  # too small to be a "decent" picture - likely an icon/logo/thumbnail
         structured.append(
             {
                 "title": r.get("title", ""),
@@ -578,11 +590,13 @@ def tool_image_search(query=None, **_kwargs):
                 # on the original site rather than Brave's thumbnail proxy,
                 # so it's more likely to be hotlink-protected; the lightbox
                 # falls back to the thumbnail if it fails to load.
-                "image_url": r.get("properties", {}).get("url", ""),
+                "image_url": properties.get("url", ""),
             }
         )
+        if len(structured) >= MAX_IMAGE_RESULTS:
+            break
     if not structured:
-        return f"No image results for '{query}'."
+        return f"No decently-sized image results for '{query}'."
     # The model can't actually see these - it's told just enough to
     # acknowledge the request without inventing a description of images it
     # never received.
