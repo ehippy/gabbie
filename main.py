@@ -37,7 +37,7 @@ PLAYBACK_COOLDOWN_SECONDS = 0.3
 AWAKE_WINDOW_SECONDS = 20  # how long a conversation stays wake-word-free
 
 NEURALFORGE_URL = "http://neuralforge:13305/v1"
-LLM_MODEL = "Qwen3.8-27B-GGUF-UD-Q4_K_XL"
+DEFAULT_LLM_MODEL = "Qwen3.8-27B-GGUF-UD-Q4_K_XL"
 TTS_MODEL = "kokoro-v1"
 TTS_VOICE = "af_heart"
 SYSTEM_PROMPT = (
@@ -99,6 +99,7 @@ MEMORY_PATH = BASE_DIR / "memory.json"
 MOOD_PATH = BASE_DIR / "mood.json"
 MOOD_MIN, MOOD_MAX = -5, 5
 MOOD_HALF_LIFE_HOURS = 6  # how fast an untouched mood drifts back to neutral
+SETTINGS_PATH = BASE_DIR / "settings.json"
 GOODBYE_WORDS = ("goodbye", "bye", "exit", "quit")
 GOODBYE_PATTERN = re.compile(r"\b(" + "|".join(GOODBYE_WORDS) + r")\b", re.IGNORECASE)
 SLEEP_PHRASES = ("stop listening", "go to sleep", "go back to sleep")
@@ -265,6 +266,28 @@ def build_system_prompt(facts, mood=0.0):
     return prompt
 
 
+def load_settings():
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_settings(**updates):
+    settings = load_settings()
+    settings.update(updates)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    return settings
+
+
+def current_llm_model():
+    # Read fresh rather than cached, so a change from the dashboard takes
+    # effect on the next LLM call instead of needing a restart.
+    return load_settings().get("llm_model") or DEFAULT_LLM_MODEL
+
+
 def open_transcript():
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPTS_DIR / f"{datetime.now().strftime('%Y-%m-%dT%H%M%S')}.jsonl"
@@ -296,7 +319,7 @@ def extract_memory_updates(client, current_facts, recent_messages):
     user_content = f"Current known facts:\n{current_block}\n\nRecent conversation:\n{convo}"
     try:
         response = client.chat.completions.create(
-            model=LLM_MODEL,
+            model=current_llm_model(),
             messages=[
                 {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
                 {"role": "user", "content": user_content},
@@ -854,7 +877,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                 buffer = ""
                 tool_calls = {}
                 llm_stream = client.chat.completions.create(
-                    model=LLM_MODEL,
+                    model=current_llm_model(),
                     messages=messages,
                     tools=TOOLS,
                     stream=True,

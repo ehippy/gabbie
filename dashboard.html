@@ -49,6 +49,9 @@
     <li class="nav-item" role="presentation">
       <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-transcripts" type="button">Transcripts</button>
     </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-settings" type="button">Settings</button>
+    </li>
   </ul>
 
   <div class="tab-content">
@@ -102,6 +105,22 @@
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-pane fade" id="pane-settings" role="tabpanel">
+      <div class="card" style="max-width: 32rem;">
+        <div class="card-header">LLM Model</div>
+        <div class="card-body">
+          <label for="model-select" class="form-label small text-secondary">
+            Used for replies and background memory extraction. Takes effect on
+            the next request - no restart needed.
+          </label>
+          <select id="model-select" class="form-select" disabled>
+            <option>Loading...</option>
+          </select>
+          <div id="model-save-status" class="small text-secondary mt-2"></div>
         </div>
       </div>
     </div>
@@ -209,6 +228,57 @@ function setMood(value, label) {
 async function loadMood() {
   const data = await fetch("/api/mood").then((r) => r.json());
   setMood(data.value, data.label);
+}
+
+// --- Settings ---
+async function loadSettings() {
+  const select = document.getElementById("model-select");
+  const [models, settings] = await Promise.all([
+    fetch("/api/models").then((r) => r.json()),
+    fetch("/api/settings").then((r) => r.json()),
+  ]);
+  select.innerHTML = "";
+  if (!models.length) {
+    select.innerHTML = '<option value="">No models available - is neuralforge running?</option>';
+    select.disabled = true;
+    return;
+  }
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    const size = m.size_gb ? `${m.size_gb} GB` : "";
+    const ctx = m.context_length ? `${Math.round(m.context_length / 1000)}k ctx` : "";
+    const detail = [size, ctx].filter(Boolean).join(", ");
+    opt.textContent = detail ? `${m.id} — ${detail}` : m.id;
+    select.appendChild(opt);
+  }
+  select.value = settings.llm_model;
+  // The saved model might not be in the downloaded+tool-calling list
+  // (renamed, removed, or picked before this filter existed) - show it
+  // anyway rather than silently switching to something the user didn't
+  // choose.
+  if (select.value !== settings.llm_model) {
+    const opt = document.createElement("option");
+    opt.value = settings.llm_model;
+    opt.textContent = `${settings.llm_model} (not currently available)`;
+    select.insertBefore(opt, select.firstChild);
+    select.value = settings.llm_model;
+  }
+  select.disabled = false;
+  select.onchange = saveModel;
+}
+
+async function saveModel() {
+  const select = document.getElementById("model-select");
+  const status = document.getElementById("model-save-status");
+  status.textContent = "Saving...";
+  const res = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ llm_model: select.value }),
+  });
+  status.textContent = res.ok ? "Saved - takes effect on the next reply." : "Failed to save.";
+  setTimeout(() => { status.textContent = ""; }, 4000);
 }
 
 // --- Memory ---
@@ -394,6 +464,7 @@ connectStream();
 loadMemory();
 loadMood();
 loadTranscriptList();
+loadSettings();
 </script>
 
 </body>

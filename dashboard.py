@@ -16,8 +16,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import httpx
+
 from eventbus import HOST as GABBIE_HOST, PORT as GABBIE_PORT
-from main import MEMORY_PATH, TRANSCRIPTS_DIR, load_memory, load_mood, mood_label
+from main import (
+    MEMORY_PATH,
+    NEURALFORGE_URL,
+    TRANSCRIPTS_DIR,
+    current_llm_model,
+    load_memory,
+    load_mood,
+    mood_label,
+    save_settings,
+)
 
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8766
@@ -58,6 +69,27 @@ def remove_fact(ts):
     if removed:
         MEMORY_PATH.write_text(json.dumps(remaining, indent=2))
     return removed
+
+
+def list_available_models():
+    # Only models already downloaded and tool-calling-capable are worth
+    # offering - Gabbie's whole tool-use flow depends on that, and a
+    # not-yet-downloaded model would silently stall the first reply while
+    # neuralforge fetches it.
+    try:
+        response = httpx.get(f"{NEURALFORGE_URL}/models", timeout=5)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return []
+    models = response.json().get("data", [])
+    return sorted(
+        (
+            {"id": m["id"], "size_gb": m.get("size"), "context_length": m.get("context_length")}
+            for m in models
+            if m.get("downloaded") and "tool-calling" in m.get("labels", [])
+        ),
+        key=lambda m: m["id"],
+    )
 
 
 def list_transcripts():
@@ -112,6 +144,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"value": round(value, 2), "label": mood_label(value)})
             return
 
+        if path == "/api/models":
+            self._send_json(list_available_models())
+            return
+
+        if path == "/api/settings":
+            self._send_json({"llm_model": current_llm_model()})
+            return
+
         if path == "/api/transcripts":
             self._send_json(list_transcripts())
             return
@@ -155,6 +195,25 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/memory/"):
             ts = unquote(path[len("/api/memory/") :])
             self._send_json({"removed": remove_fact(ts)})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/settings":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+            model = body.get("llm_model")
+            if not isinstance(model, str) or not model.strip():
+                self._send_json({"error": "llm_model must be a non-empty string"}, status=400)
+                return
+            save_settings(llm_model=model.strip())
+            self._send_json({"llm_model": model.strip()})
             return
         self.send_response(404)
         self.end_headers()
