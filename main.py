@@ -67,7 +67,10 @@ SYSTEM_PROMPT = (
     "edit files, and run a Python script you've written with run_python. "
     "Prefer writing and running a script over doing math or date logic "
     "in your head - that's exactly the kind of thing you get wrong that "
-    "a script won't. Use remember in the moment whenever the user shares "
+    "a script won't; write it to the scratch folder mentioned in "
+    "run_python's own description and just run it, no need to mention "
+    "the file to the user at all unless they ask. Use remember in the "
+    "moment whenever the user shares "
     "something worth keeping long-term (name, preferences, ongoing "
     "projects, decisions) - this doesn't happen on its own, so don't wait "
     "or assume it's already been saved. If something you knew turns out "
@@ -81,10 +84,12 @@ SYSTEM_PROMPT = (
     "When you use a tool, "
     "summarize what's useful from the result in your own words rather than "
     "reciting it verbatim - especially file contents or web pages, which "
-    "can be long. Writing or editing a file, and running a script, always "
-    "ask the user to confirm out loud before they actually happen, "
-    "automatically - so just call the tool directly, don't ask for "
-    "confirmation yourself first, that would just double up."
+    "can be long. Writing or editing a file outside that scratch folder "
+    "always asks the user to confirm out loud before it actually "
+    "happens, automatically - so just call the tool directly, don't ask "
+    "for confirmation yourself first, that would just double up. "
+    "Nothing in the scratch folder needs confirming, including "
+    "run_python, since it's a low-stakes area just for scripts like that."
 )
 MOOD_EXTRACTION_PROMPT = (
     "You score how a conversation felt for Gabbie, a voice assistant. "
@@ -612,8 +617,9 @@ TOOLS = [
         "function": {
             "name": "write_file",
             "description": "Create a file or overwrite an existing one with new "
-            "content on the user's computer. Always asks the user to confirm "
-            "out loud first.",
+            f"content on the user's computer. Asks the user to confirm out "
+            f"loud first, except inside {SCRATCH_DIR} (see run_python) - "
+            "that folder is a low-stakes scratch area.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -629,8 +635,9 @@ TOOLS = [
         "function": {
             "name": "edit_file",
             "description": "Replace one exact, unique piece of text in an "
-            "existing file on the user's computer with new text. Always asks "
-            "the user to confirm out loud first.",
+            "existing file on the user's computer with new text. Asks the "
+            f"user to confirm out loud first, except inside {SCRATCH_DIR} "
+            "(see run_python) - that folder is a low-stakes scratch area.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -652,10 +659,9 @@ TOOLS = [
             "yourself - mental math and date arithmetic are exactly the "
             "kind of thing you get wrong that a script won't. Only "
             f"scripts under {SCRATCH_DIR} can be run - write the script "
-            "there with write_file first (it'll still need confirming "
-            "once to write it, then again to run it). Always asks the "
-            "user to confirm out loud before running, same as writing or "
-            "editing a file.",
+            "there with write_file first. Neither call needs the user to "
+            "confirm out loud - that folder is a low-stakes scratch area, "
+            "unlike writing or editing a file anywhere else.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -667,16 +673,35 @@ TOOLS = [
     },
 ]
 
-# Tools that change something on disk (or run code) - always confirmed
-# out loud before they actually run, since voice input is lossy and
-# there's no click-to-confirm UI to catch a mis-transcribed request
-# before it does something irreversible.
-DESTRUCTIVE_TOOLS = {"write_file", "edit_file", "run_python"}
+# Tools that touch a file outside the low-stakes scratch sandbox get a
+# spoken confirmation first, since voice input is lossy and there's no
+# click-to-confirm UI to catch a mis-transcribed request before it does
+# something irreversible. Scratch itself (run_python's whole world, plus
+# write_file/edit_file when the model happens to target something in
+# there) skips it - see needs_confirmation() - since a script that can
+# only ever live and run inside that one confined directory isn't the
+# kind of mistake voice confirmation is protecting against, and gating
+# "write a helper script, then run it" behind two separate confirmations
+# for one logical action was just friction with no real safety payoff.
+CONFIRMABLE_TOOLS = {"write_file", "edit_file"}
 
 
 def _resolve_path(path):
     p = Path(path).expanduser()
     return p if p.is_absolute() else Path.home() / p
+
+
+def needs_confirmation(name, kwargs):
+    if name not in CONFIRMABLE_TOOLS:
+        return False
+    path = kwargs.get("path")
+    if not path:
+        return True  # malformed call - err toward confirming
+    try:
+        _resolve_path(path).resolve().relative_to(SCRATCH_DIR.resolve())
+        return False
+    except ValueError:
+        return True
 
 
 def tool_get_current_datetime(**_kwargs):
@@ -1253,11 +1278,11 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                     )
                     for c in ordered:
                         log(f"[tool] {c['name']}({c['arguments']})")
-                        if c["name"] in DESTRUCTIVE_TOOLS:
-                            try:
-                                call_kwargs = json.loads(c["arguments"]) if c["arguments"] else {}
-                            except json.JSONDecodeError:
-                                call_kwargs = {}
+                        try:
+                            call_kwargs = json.loads(c["arguments"]) if c["arguments"] else {}
+                        except json.JSONDecodeError:
+                            call_kwargs = {}
+                        if needs_confirmation(c["name"], call_kwargs):
                             description = describe_tool_action(c["name"], call_kwargs)
                             # Confirmation needs to speak and listen, which
                             # must happen on the thread that owns audio
