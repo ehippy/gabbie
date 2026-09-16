@@ -98,7 +98,7 @@
             </div>
             <div class="card-body">
               <div id="live-conversation" class="scroll-panel">
-                <p class="text-secondary small mb-0">Nothing yet - say the wake word to start.</p>
+                <p class="text-secondary small mb-0 placeholder-msg">Nothing yet - say the wake word to start.</p>
               </div>
             </div>
           </div>
@@ -108,7 +108,7 @@
             <div class="card-header">Tool Activity</div>
             <div class="card-body">
               <div id="web-activity" class="scroll-panel">
-                <p class="text-secondary small mb-0">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>
+                <p class="text-secondary small mb-0 placeholder-msg">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>
               </div>
             </div>
           </div>
@@ -253,7 +253,7 @@ function connectStream() {
 // --- Conversation ---
 function appendConversationLine(role, text, tsIso) {
   const el = document.getElementById("live-conversation");
-  const placeholder = el.querySelector(".text-secondary.small");
+  const placeholder = el.querySelector(".placeholder-msg");
   if (placeholder) el.innerHTML = "";
   const div = document.createElement("div");
   div.className = "msg mb-2";
@@ -274,9 +274,9 @@ function appendConversationLine(role, text, tsIso) {
 // this only happens once Gabbie has really wiped her own history too.
 function resetConversationView() {
   document.getElementById("live-conversation").innerHTML =
-    '<p class="text-secondary small mb-0">Nothing yet - say the wake word to start.</p>';
+    '<p class="text-secondary small mb-0 placeholder-msg">Nothing yet - say the wake word to start.</p>';
   document.getElementById("web-activity").innerHTML =
-    '<p class="text-secondary small mb-0">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>';
+    '<p class="text-secondary small mb-0 placeholder-msg">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>';
 }
 
 document.getElementById("new-conversation-btn").onclick = async () => {
@@ -477,7 +477,7 @@ const TOOL_ICONS = {
 
 function renderToolCall(evt) {
   const el = document.getElementById("web-activity");
-  const placeholder = el.querySelector(".text-secondary.small");
+  const placeholder = el.querySelector(".placeholder-msg");
   if (placeholder) el.innerHTML = "";
 
   const card = document.createElement("div");
