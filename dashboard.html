@@ -218,18 +218,22 @@ function appendConversationLine(role, text, tsIso) {
   el.scrollTop = el.scrollHeight;
 }
 
-// Rebuilds the feed from the current session's transcript (the most
-// recent one - main.py starts a fresh file each run and appends to it
-// for the rest of that run) so a page refresh doesn't lose everything
-// said before the reload. Only covers completed turns; anything from
-// here on comes in live over the SSE stream in connectStream().
-async function hydrateConversation() {
+// Rebuilds the conversation feed AND Web Activity from the current
+// session's transcript (the most recent one - main.py starts a fresh
+// file each run and appends to it for the rest of that run, tool calls
+// included) so a page refresh doesn't lose everything from before the
+// reload. Only covers completed turns/calls; anything from here on
+// comes in live over the SSE stream in connectStream(). renderToolCall
+// is defined later in this file but hoisted, so it's callable here.
+async function hydrateFromTranscript() {
   const names = await fetch("/api/transcripts").then((r) => r.json());
   if (!names.length) return;
   const entries = await fetch("/api/transcripts/" + encodeURIComponent(names[0])).then((r) => r.json());
   for (const entry of entries) {
     if (entry.role === "user" || entry.role === "assistant") {
       appendConversationLine(entry.role, entry.content, entry.ts);
+    } else if (entry.role === "tool_call" && entry.content) {
+      renderToolCall(entry.content);
     }
   }
 }
@@ -353,6 +357,10 @@ async function selectTranscript(name, itemEl) {
   const view = document.getElementById("transcript-view");
   view.innerHTML = "";
   for (const entry of entries) {
+    // tool_call entries carry an object in .content (name/arguments/
+    // result/extra), not text to render here - Web Activity replays
+    // those via renderToolCall() instead; this view stays conversation-only.
+    if (entry.role !== "user" && entry.role !== "assistant") continue;
     const div = document.createElement("div");
     div.className = "msg mb-2";
     const roleClass = entry.role === "user" ? "user" : "assistant";
@@ -488,7 +496,7 @@ lightboxEl.addEventListener("keydown", (e) => {
 // Hydrate before opening the live stream, so a "heard"/"speaking" event
 // that arrives moments after connecting can't render above history that
 // hasn't loaded yet.
-hydrateConversation().then(connectStream);
+hydrateFromTranscript().then(connectStream);
 loadMemory();
 loadMood();
 loadTranscriptList();

@@ -955,7 +955,7 @@ def confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisp
     return False
 
 
-def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper, messages):
+def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper, messages, transcript_path):
     """Stream the LLM reply, synthesizing and playing each sentence as soon
     as it's complete instead of waiting for the whole reply. Returns the
     full reply text once everything has finished playing."""
@@ -1085,6 +1085,20 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                             arguments=c["arguments"],
                             result=result_text,
                             extra=result_extra,
+                        )
+                        # So the dashboard can rehydrate Web Activity on
+                        # refresh instead of only ever showing tool calls
+                        # made after the page happened to be open - same
+                        # motivation as logging user/assistant turns below.
+                        append_transcript(
+                            transcript_path,
+                            "tool_call",
+                            {
+                                "name": c["name"],
+                                "arguments": c["arguments"],
+                                "result": result_text,
+                                "extra": result_extra,
+                            },
                         )
                         messages.append(
                             {"role": "tool", "tool_call_id": c["id"], "content": result_text}
@@ -1300,7 +1314,7 @@ def main():
                 events.publish("thinking")
                 t0 = time.time()
                 reply = think_and_speak(
-                    client, listening_enabled, audio_queue, events, vad, whisper, messages
+                    client, listening_enabled, audio_queue, events, vad, whisper, messages, transcript_path
                 )
                 # Start the awake window now that the mic is live again,
                 # rather than from when the user last spoke - otherwise a
