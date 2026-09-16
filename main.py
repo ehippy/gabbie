@@ -7,6 +7,8 @@ import os
 import queue
 import random
 import re
+import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -61,8 +63,11 @@ SYSTEM_PROMPT = (
     "claiming you have no memory at all. You also have tools to check the "
     "current date/time, manage that long-term memory, list/read files on "
     "the user's computer, search the web, fetch a specific web page, "
-    "search for images, actually look at one of those images, and write "
-    "or edit files. Use remember in the moment whenever the user shares "
+    "search for images, actually look at one of those images, write or "
+    "edit files, and run a Python script you've written with run_python. "
+    "Prefer writing and running a script over doing math or date logic "
+    "in your head - that's exactly the kind of thing you get wrong that "
+    "a script won't. Use remember in the moment whenever the user shares "
     "something worth keeping long-term (name, preferences, ongoing "
     "projects, decisions) - this doesn't happen on its own, so don't wait "
     "or assume it's already been saved. If something you knew turns out "
@@ -76,10 +81,10 @@ SYSTEM_PROMPT = (
     "When you use a tool, "
     "summarize what's useful from the result in your own words rather than "
     "reciting it verbatim - especially file contents or web pages, which "
-    "can be long. Writing or editing a file always asks the user to "
-    "confirm out loud before it actually happens, automatically - so just "
-    "call the tool directly when asked to write or edit something, don't "
-    "ask for confirmation yourself first, that would just double up."
+    "can be long. Writing or editing a file, and running a script, always "
+    "ask the user to confirm out loud before they actually happen, "
+    "automatically - so just call the tool directly, don't ask for "
+    "confirmation yourself first, that would just double up."
 )
 MOOD_EXTRACTION_PROMPT = (
     "You score how a conversation felt for Gabbie, a voice assistant. "
@@ -97,6 +102,12 @@ TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
 # restart (crash, --watch, Ctrl+C) so the dashboard doesn't see that as a
 # new session; only start_new_transcript()/end_transcript_session() touch it.
 TRANSCRIPT_POINTER_PATH = BASE_DIR / "current_transcript.txt"
+# Where run_python executes from - deliberately not "anywhere in $HOME"
+# like read_file/write_file. This is the one tool that runs code rather
+# than just moving text around, so it gets an actual boundary: only
+# scripts written here (via write_file first) can be run at all.
+SCRATCH_DIR = BASE_DIR / "scratch"
+RUN_PYTHON_TIMEOUT_SECONDS = 10
 MEMORY_PATH = BASE_DIR / "memory.json"
 # Existence alone is the signal - dashboard.py's "New Conversation" button
 # touches this file; main.py's loop notices it between turns and clears it.
@@ -631,13 +642,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": "Run a Python script and return its printed "
+            "output. Use this to actually execute logic you've written "
+            f"(like a date calculation) instead of working it out "
+            "yourself - mental math and date arithmetic are exactly the "
+            "kind of thing you get wrong that a script won't. Only "
+            f"scripts under {SCRATCH_DIR} can be run - write the script "
+            "there with write_file first (it'll still need confirming "
+            "once to write it, then again to run it). Always asks the "
+            "user to confirm out loud before running, same as writing or "
+            "editing a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": f"Path to the .py file, under {SCRATCH_DIR}"}
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
-# Tools that change something on disk - always confirmed out loud before
-# they actually run, since voice input is lossy and there's no click-to-
-# confirm UI to catch a mis-transcribed request before it does something
-# irreversible.
-DESTRUCTIVE_TOOLS = {"write_file", "edit_file"}
+# Tools that change something on disk (or run code) - always confirmed
+# out loud before they actually run, since voice input is lossy and
+# there's no click-to-confirm UI to catch a mis-transcribed request
+# before it does something irreversible.
+DESTRUCTIVE_TOOLS = {"write_file", "edit_file", "run_python"}
 
 
 def _resolve_path(path):
@@ -998,12 +1032,46 @@ def tool_edit_file(path=None, old_text=None, new_text=None, **_kwargs):
     return f"Replaced the text in {p}."
 
 
+def tool_run_python(path=None, **_kwargs):
+    if not path:
+        return "Error: no path given"
+    SCRATCH_DIR.mkdir(exist_ok=True)
+    target = _resolve_path(path).resolve()
+    try:
+        target.relative_to(SCRATCH_DIR.resolve())
+    except ValueError:
+        return f"Error: run_python can only run scripts under {SCRATCH_DIR} - write it there with write_file first."
+    if not target.exists():
+        return f"Error: no such file: {target}"
+    if target.suffix != ".py":
+        return "Error: run_python only runs .py files"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(target)],
+            capture_output=True,
+            text=True,
+            timeout=RUN_PYTHON_TIMEOUT_SECONDS,
+            cwd=SCRATCH_DIR,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: script timed out after {RUN_PYTHON_TIMEOUT_SECONDS}s - it may be stuck in a loop."
+    except OSError as e:
+        return f"Error running script: {e}"
+    output = (result.stdout + result.stderr).strip() or "(no output)"
+    if len(output) > MAX_FILE_CHARS:
+        output = output[:MAX_FILE_CHARS] + f"\n\n[...truncated, {len(output)} characters total]"
+    status = "" if result.returncode == 0 else f" (exited with code {result.returncode})"
+    return f"Output{status}:\n{output}"
+
+
 def describe_tool_action(name, kwargs):
     path = kwargs.get("path", "(unknown path)")
     if name == "write_file":
         return f"I want to write to the file {path}."
     if name == "edit_file":
         return f"I want to edit the file {path}."
+    if name == "run_python":
+        return f"I want to run the script {path}."
     return f"I want to run {name}."
 
 
@@ -1021,6 +1089,7 @@ TOOL_FUNCTIONS = {
     "fetch_url": tool_fetch_url,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
+    "run_python": tool_run_python,
 }
 
 
