@@ -555,7 +555,7 @@ def tool_image_search(query=None, **_kwargs):
     try:
         response = httpx.get(
             BRAVE_IMAGE_SEARCH_URL,
-            params={"q": query, "count": 6},
+            params={"q": query, "count": 20},
             headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
             timeout=10,
         )
@@ -565,7 +565,7 @@ def tool_image_search(query=None, **_kwargs):
         return f"Error: image search returned HTTP {response.status_code}"
     results = response.json().get("results", [])
     structured = []
-    for r in results[:6]:
+    for r in results[:20]:
         thumbnail = r.get("thumbnail", {}).get("src")
         if not thumbnail:
             continue  # nothing to show for this one, skip it
@@ -574,6 +574,11 @@ def tool_image_search(query=None, **_kwargs):
                 "title": r.get("title", ""),
                 "source_url": r.get("url", ""),
                 "thumbnail": thumbnail,
+                # Full-resolution image for the dashboard's lightbox - hosted
+                # on the original site rather than Brave's thumbnail proxy,
+                # so it's more likely to be hotlink-protected; the lightbox
+                # falls back to the thumbnail if it fails to load.
+                "image_url": r.get("properties", {}).get("url", ""),
             }
         )
     if not structured:
