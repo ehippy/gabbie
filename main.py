@@ -596,7 +596,11 @@ TOOLS = [
             "picture out loud, so only use this when the user asks to see, "
             "find, or look up pictures/photos/images of something - the "
             "results are visual only, not something to describe back unless "
-            "the user then asks you to look at one with view_image.",
+            "the user then asks you to look at one with view_image. Returns "
+            "every decently-sized result there is for the query, not just a "
+            "sample - there's no pagination or 'next page' to fetch after "
+            "this, so don't offer one. If nothing decent turns up, a "
+            "narrower or different query is the only way to get more.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Image search query"}},
@@ -931,8 +935,12 @@ def tool_web_search(query=None, **_kwargs):
     return "\n".join(lines), {"query": query, "results": structured}
 
 
-MAX_IMAGE_RESULTS = 20
 MIN_IMAGE_DIMENSION = 400  # px, on the shorter side - filters out icons/logos/tiny thumbnails
+# Brave's Image Search has no pagination at all - no offset param, and
+# their own docs say to just raise count instead. 100 is their
+# documented max, so this is the largest single batch obtainable; there
+# is no "next page" to fetch beyond it.
+BRAVE_IMAGE_SEARCH_COUNT = 100
 # Results from the most recent image_search, so a later "look at the second
 # one" doesn't need the model to pass a URL around - single conversation,
 # single process, so plain module state is enough.
@@ -944,14 +952,17 @@ def tool_image_search(query=None, **_kwargs):
         return "Error: no query given"
     if not BRAVE_API_KEY:
         return "Error: image search isn't set up yet - no BRAVE_API_KEY configured."
-    # Brave doesn't offer a server-side size filter, so over-fetch (its max)
-    # and filter by actual source dimensions below - otherwise a query
-    # dominated by small icons/logos could come back mostly filtered out.
+    # Brave doesn't offer a server-side size filter, so over-fetch (its max
+    # - see BRAVE_IMAGE_SEARCH_COUNT) and filter by actual source
+    # dimensions below - otherwise a query dominated by small icons/logos
+    # could come back mostly filtered out.
     # safesearch=off because Brave's default (moderate) returns zero
     # results outright for some queries rather than just filtering them -
     # this is a personal local assistant with no separate content policy
     # to defer to.
-    response, error = _brave_get(BRAVE_IMAGE_SEARCH_URL, {"q": query, "count": 50, "safesearch": "off"})
+    response, error = _brave_get(
+        BRAVE_IMAGE_SEARCH_URL, {"q": query, "count": BRAVE_IMAGE_SEARCH_COUNT, "safesearch": "off"}
+    )
     if error:
         return error
     if response.status_code == 429:
@@ -980,14 +991,19 @@ def tool_image_search(query=None, **_kwargs):
                 "image_url": properties.get("url", ""),
             }
         )
-        if len(structured) >= MAX_IMAGE_RESULTS:
-            break
     if not structured:
-        return f"No decently-sized image results for '{query}'."
+        return f"No decently-sized image results for '{query}' ({len(results)} results total, none met the size bar)."
     # The model can't actually see these - it's told just enough to
     # acknowledge the request without inventing a description of images it
-    # never received.
-    text = f"Found {len(structured)} images for '{query}' - shown on the dashboard, not spoken."
+    # never received. Also tells it the raw-vs-kept counts so it can
+    # honestly convey "there were more, most just weren't decent-sized"
+    # instead of implying a fetchable next page - Brave's image search has
+    # no pagination at all, this single batch is the whole result set.
+    text = (
+        f"Found {len(structured)} decently-sized images for '{query}' (out of {len(results)} "
+        "total results) - shown on the dashboard, not spoken. This is the whole result set - "
+        "there's no further page to fetch for this query."
+    )
     global _last_image_results
     _last_image_results = structured
     return text, {"query": query, "results": structured}
