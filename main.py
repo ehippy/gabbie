@@ -181,10 +181,21 @@ def contains_affirmative(text):
 def transcribe(whisper, audio):
     if audio.size == 0:
         return ""
+    # Whisper is well known to hallucinate text on silence/near-silence,
+    # and initial_prompt makes it worse here specifically - it conditions
+    # the decoder on "Gabbie" as prior context, so a quiet room that
+    # barely trips the VAD upstream can come back as "Gabbie Gabbie" with
+    # nobody having said anything. hotwords biases recognition toward the
+    # wake word the same way without that conditioning effect, vad_filter
+    # runs a second, more precise VAD pass to skip non-speech chunks
+    # before decoding at all, and the no_speech_prob check below is a last
+    # line of defense against whatever gets through anyway.
     segments, _ = whisper.transcribe(
-        audio, language="en", initial_prompt="Gabbie"
+        audio, language="en", hotwords="Gabbie", vad_filter=True
     )
-    return " ".join(segment.text.strip() for segment in segments).strip()
+    return " ".join(
+        segment.text.strip() for segment in segments if segment.no_speech_prob < 0.6
+    ).strip()
 
 
 def synthesize(client, text):
