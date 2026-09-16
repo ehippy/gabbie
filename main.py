@@ -1,3 +1,4 @@
+import base64
 import collections
 import html.parser
 import io
@@ -59,10 +60,12 @@ SYSTEM_PROMPT = (
     "something about the user yet, say so plainly rather than claiming you "
     "have no memory at all. You also have tools to check the current date/"
     "time, list/read files on the user's computer, search the web, fetch a "
-    "specific web page, search for images, and write or edit files. Image "
-    "search shows results on the local dashboard, not out loud - you can't "
-    "see the images either, so after calling it just acknowledge that "
-    "you've pulled them up, don't invent a description of what's in them. "
+    "specific web page, search for images, actually look at one of those "
+    "images, and write or edit files. image_search only surfaces results "
+    "on the local dashboard - you don't see them from that alone, so just "
+    "acknowledge you've pulled them up rather than describing them. If the "
+    "user then asks you to look at, describe, compare, or react to one of "
+    "them, use view_image to actually see it instead of guessing. "
     "When you use a tool, "
     "summarize what's useful from the result in your own words rather than "
     "reciting it verbatim - especially file contents or web pages, which "
@@ -480,11 +483,37 @@ TOOLS = [
             "display them on the local dashboard. There's no way to show a "
             "picture out loud, so only use this when the user asks to see, "
             "find, or look up pictures/photos/images of something - the "
-            "result is visual only, not something to describe back.",
+            "results are visual only, not something to describe back unless "
+            "the user then asks you to look at one with view_image.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Image search query"}},
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": "Actually look at one specific image from the "
+            "most recent image_search results and describe or react to "
+            "what's in it. Use this only when the user asks you to look at, "
+            "describe, compare, or react to a specific picture (e.g. 'what "
+            "do you think of the second one', 'describe that first image') "
+            "- don't call it just because image_search found results, and "
+            "it only works after image_search has already run this "
+            "conversation. It takes noticeably longer than image_search "
+            "since it has to actually process the image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "Which image, counting from 1 for the first result, 2 for the second, etc.",
+                    }
+                },
+                "required": ["index"],
             },
         },
     },
@@ -676,6 +705,10 @@ def tool_web_search(query=None, **_kwargs):
 
 MAX_IMAGE_RESULTS = 20
 MIN_IMAGE_DIMENSION = 400  # px, on the shorter side - filters out icons/logos/tiny thumbnails
+# Results from the most recent image_search, so a later "look at the second
+# one" doesn't need the model to pass a URL around - single conversation,
+# single process, so plain module state is enough.
+_last_image_results = []
 
 
 def tool_image_search(query=None, **_kwargs):
@@ -727,7 +760,73 @@ def tool_image_search(query=None, **_kwargs):
     # acknowledge the request without inventing a description of images it
     # never received.
     text = f"Found {len(structured)} images for '{query}' - shown on the dashboard, not spoken."
+    global _last_image_results
+    _last_image_results = structured
     return text, {"query": query, "results": structured}
+
+
+VIEW_IMAGE_PROMPT = (
+    "Describe what's shown in this image factually and specifically - "
+    "subject, setting, notable details - in 2-3 sentences. Someone else "
+    "will paraphrase your description out loud, so be accurate and "
+    "concrete rather than trying to sound conversational yourself."
+)
+
+
+def tool_view_image(index=None, client=None, **_kwargs):
+    if not _last_image_results:
+        return "Error: no recent image search results to look at - run image_search first."
+    try:
+        position = int(index) - 1
+    except (TypeError, ValueError):
+        return "Error: index must be a number - 1 for the first image, 2 for the second, etc."
+    if not 0 <= position < len(_last_image_results):
+        return f"Error: only {len(_last_image_results)} image(s) available from the last search."
+    image = _last_image_results[position]
+    for url in (image.get("image_url"), image.get("thumbnail")):
+        if not url:
+            continue
+        try:
+            response = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, follow_redirects=True)
+            response.raise_for_status()
+            break
+        except httpx.HTTPError:
+            continue  # full-res source may block hotlinking - fall back to the thumbnail
+    else:
+        return "Error: couldn't load that image to look at it."
+    content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    data_url = f"data:{content_type};base64,{base64.b64encode(response.content).decode()}"
+    try:
+        vision_response = client.chat.completions.create(
+            model=current_llm_model(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": VIEW_IMAGE_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            max_tokens=300,
+            temperature=0.6,
+            # Same fix as the main reply loop: this model "thinks" by
+            # default, which for a fixed max_tokens budget can burn the
+            # whole thing on hidden reasoning and leave zero visible
+            # content (finish_reason "length", empty text) - seen directly
+            # while testing this against a real vision call.
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        description = (vision_response.choices[0].message.content or "").strip()
+        if not description:
+            return "Error: the model didn't return a description for that image - try again."
+        return description, {
+            "index": position + 1,
+            "title": image.get("title", ""),
+            "thumbnail": image.get("thumbnail", ""),
+        }
+    except Exception as e:
+        return f"Error: the current model couldn't process the image ({e}) - try a vision-capable model in Settings."
 
 
 def tool_write_file(path=None, content=None, **_kwargs):
@@ -785,16 +884,19 @@ TOOL_FUNCTIONS = {
     "read_file": tool_read_file,
     "web_search": tool_web_search,
     "image_search": tool_image_search,
+    "view_image": tool_view_image,
     "fetch_url": tool_fetch_url,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
 }
 
 
-def execute_tool(name, arguments_json):
+def execute_tool(name, arguments_json, client=None):
     """Returns (text_for_the_model, extra_for_display). extra_for_display is
     None unless the tool has something worth showing visually (e.g. search
-    results) - most tools just return a plain string, normalized here."""
+    results) - most tools just return a plain string, normalized here.
+    client is only used by view_image (needs it for the vision call) -
+    every other tool ignores it via its **_kwargs catch-all."""
     try:
         kwargs = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError:
@@ -803,7 +905,7 @@ def execute_tool(name, arguments_json):
     if not func:
         return f"Error: unknown tool '{name}'", None
     try:
-        result = func(**kwargs)
+        result = func(client=client, **kwargs)
     except Exception as e:
         return f"Error running {name}: {e}", None
     if isinstance(result, tuple):
@@ -969,14 +1071,14 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                             sentence_queue.put(("confirm", description, response_box))
                             approved = response_box.get()
                             if approved:
-                                result_text, result_extra = execute_tool(c["name"], c["arguments"])
+                                result_text, result_extra = execute_tool(c["name"], c["arguments"], client=client)
                             else:
                                 result_text, result_extra = (
                                     "The user did not confirm this action, so it was not performed.",
                                     None,
                                 )
                         else:
-                            result_text, result_extra = execute_tool(c["name"], c["arguments"])
+                            result_text, result_extra = execute_tool(c["name"], c["arguments"], client=client)
                         events.publish(
                             "tool_call",
                             name=c["name"],
