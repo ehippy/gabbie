@@ -630,7 +630,7 @@ def tool_web_search(query=None, **_kwargs):
         return "Error: no query given"
     if not BRAVE_API_KEY:
         return "Error: web search isn't set up yet - no BRAVE_API_KEY configured."
-    response, error = _brave_get(BRAVE_SEARCH_URL, {"q": query, "count": 5})
+    response, error = _brave_get(BRAVE_SEARCH_URL, {"q": query, "count": 5, "safesearch": "off"})
     if error:
         return error
     if response.status_code == 429:
@@ -663,7 +663,11 @@ def tool_image_search(query=None, **_kwargs):
     # Brave doesn't offer a server-side size filter, so over-fetch (its max)
     # and filter by actual source dimensions below - otherwise a query
     # dominated by small icons/logos could come back mostly filtered out.
-    response, error = _brave_get(BRAVE_IMAGE_SEARCH_URL, {"q": query, "count": 50})
+    # safesearch=off because Brave's default (moderate) returns zero
+    # results outright for some queries rather than just filtering them -
+    # this is a personal local assistant with no separate content policy
+    # to defer to.
+    response, error = _brave_get(BRAVE_IMAGE_SEARCH_URL, {"q": query, "count": 50, "safesearch": "off"})
     if error:
         return error
     if response.status_code == 429:
