@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Gabbie</title>
+<link
+  href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+  rel="stylesheet"
+/>
+<style>
+  #dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background-color: var(--bs-secondary);
+    display: inline-block;
+    transition: background-color 0.2s ease;
+  }
+  .dot-listening, .dot-transcribing { background-color: var(--bs-success) !important; }
+  .dot-thinking { background-color: var(--bs-warning) !important; }
+  .dot-speaking { background-color: var(--bs-primary) !important; }
+  .dot-sleeping { background-color: #8850c8 !important; }
+  .scroll-panel { max-height: 480px; overflow-y: auto; }
+  #lastline { max-width: 45%; }
+  .msg .role.user { color: var(--bs-info); }
+  .msg .role.assistant { color: var(--bs-success); }
+</style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand bg-body-tertiary border-bottom mb-4">
+  <div class="container-fluid">
+    <span class="navbar-brand d-flex align-items-center gap-2 mb-0">
+      <span id="dot"></span> Gabbie
+    </span>
+    <span id="state" class="text-secondary text-capitalize small">disconnected</span>
+    <span id="lastline" class="text-secondary small ms-auto text-truncate"></span>
+  </div>
+</nav>
+
+<div class="container-fluid">
+  <div class="row g-4">
+    <div class="col-lg-5">
+      <div class="card">
+        <div class="card-header">Memory</div>
+        <div class="card-body">
+          <div id="memory-list" class="list-group list-group-flush scroll-panel">
+            <p class="text-secondary small mb-0">Loading...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-lg-7">
+      <div class="card">
+        <div class="card-header">Transcripts</div>
+        <div class="card-body">
+          <div class="row">
+            <div class="col-4 border-end">
+              <div id="transcript-list" class="list-group list-group-flush scroll-panel">
+                <p class="text-secondary small mb-0">Loading...</p>
+              </div>
+            </div>
+            <div class="col-8">
+              <div id="transcript-view" class="scroll-panel">
+                <p class="text-secondary small mb-0">Pick a session to view it.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-4 mt-1">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header">Web Activity</div>
+        <div class="card-body">
+          <div id="web-activity" class="scroll-panel">
+            <p class="text-secondary small mb-0">Nothing yet - ask Gabbie to search or fetch something.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function setStatus(state) {
+  document.getElementById("state").textContent = state;
+  const dot = document.getElementById("dot");
+  dot.className = "";
+  dot.classList.add("dot-" + state);
+}
+
+function setLastLine(text) {
+  document.getElementById("lastline").textContent = text;
+}
+
+// --- Live status ---
+function connectStream() {
+  const es = new EventSource("/api/status/stream");
+  setStatus("connected");
+  es.onmessage = (e) => {
+    const evt = JSON.parse(e.data);
+    switch (evt.event) {
+      case "listening":
+      case "transcribing":
+      case "thinking":
+      case "sleeping":
+        setStatus(evt.event);
+        break;
+      case "heard":
+        if (!evt.ignored) setLastLine("You: " + evt.text);
+        break;
+      case "speaking":
+        setStatus("speaking");
+        setLastLine("Gabbie: " + evt.text);
+        break;
+      case "done_speaking":
+        setStatus("listening");
+        break;
+      case "bye":
+        setStatus("idle");
+        break;
+      case "remembered":
+      case "forgot":
+        loadMemory();
+        break;
+      case "tool_call":
+        renderToolCall(evt);
+        break;
+    }
+  };
+  es.onerror = () => {
+    setStatus("disconnected");
+    setLastLine("");
+    es.close();
+    setTimeout(connectStream, 2000);
+  };
+}
+
+// --- Memory ---
+async function loadMemory() {
+  const facts = await fetch("/api/memory").then((r) => r.json());
+  const el = document.getElementById("memory-list");
+  if (!facts.length) {
+    el.innerHTML = '<p class="text-secondary small mb-0">Nothing remembered yet.</p>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const f of facts) {
+    const row = document.createElement("div");
+    row.className = "list-group-item d-flex justify-content-between align-items-start gap-2";
+    row.innerHTML = `
+      <div>
+        <div>${escapeHtml(f.fact)}</div>
+        <div class="text-secondary" style="font-size: 0.75rem;">${f.ts || ""}</div>
+      </div>`;
+    const btn = document.createElement("button");
+    btn.className = "btn btn-sm btn-outline-danger flex-shrink-0";
+    btn.textContent = "forget";
+    btn.onclick = async () => {
+      await fetch("/api/memory/" + encodeURIComponent(f.ts), { method: "DELETE" });
+      loadMemory();
+    };
+    row.appendChild(btn);
+    el.appendChild(row);
+  }
+}
+
+// --- Transcripts ---
+async function loadTranscriptList() {
+  const names = await fetch("/api/transcripts").then((r) => r.json());
+  const el = document.getElementById("transcript-list");
+  if (!names.length) {
+    el.innerHTML = '<p class="text-secondary small mb-0">No sessions yet.</p>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const name of names) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "list-group-item list-group-item-action small";
+    item.textContent = name.replace(".jsonl", "").replace("T", " ");
+    item.onclick = () => selectTranscript(name, item);
+    el.appendChild(item);
+  }
+}
+
+async function selectTranscript(name, itemEl) {
+  document.querySelectorAll("#transcript-list .list-group-item").forEach((el) => el.classList.remove("active"));
+  itemEl.classList.add("active");
+  const entries = await fetch("/api/transcripts/" + encodeURIComponent(name)).then((r) => r.json());
+  const view = document.getElementById("transcript-view");
+  view.innerHTML = "";
+  for (const entry of entries) {
+    const div = document.createElement("div");
+    div.className = "msg mb-2";
+    const roleClass = entry.role === "user" ? "user" : "assistant";
+    const roleLabel = entry.role === "user" ? "You" : "Gabbie";
+    div.innerHTML = `
+      <span class="role ${roleClass} fw-semibold small">${roleLabel}</span>
+      <span class="text-secondary" style="font-size: 0.75rem;">${entry.ts || ""}</span>
+      <div>${escapeHtml(entry.content)}</div>`;
+    view.appendChild(div);
+  }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+// Only allow http(s) links, and let the URL parser normalize/encode them -
+// this is result data from a search API / fetched page, so it's untrusted.
+function safeUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+  } catch (e) {
+    /* fall through */
+  }
+  return "#";
+}
+
+// --- Web Activity ---
+function renderToolCall(evt) {
+  const el = document.getElementById("web-activity");
+  if (evt.name !== "web_search" && evt.name !== "fetch_url") return; // other tools aren't screen-shaped
+  const placeholder = el.querySelector(".text-secondary.small");
+  if (placeholder) el.innerHTML = "";
+
+  const card = document.createElement("div");
+  card.className = "border-bottom pb-2 mb-2";
+
+  if (evt.name === "web_search" && evt.extra) {
+    let html = `<div class="fw-semibold mb-1">🔎 "${escapeHtml(evt.extra.query)}"</div>`;
+    for (const r of evt.extra.results || []) {
+      html += `
+        <div class="mb-2">
+          <a href="${safeUrl(r.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(r.title)}</a>
+          <div class="text-secondary small">${escapeHtml(r.description)}</div>
+        </div>`;
+    }
+    card.innerHTML = html;
+  } else if (evt.name === "fetch_url" && evt.extra) {
+    card.innerHTML = `
+      <div class="fw-semibold mb-1">🌐 Fetched</div>
+      <a href="${safeUrl(evt.extra.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(evt.extra.url)}</a>`;
+  } else {
+    return; // an error result with no structured data - nothing to show visually
+  }
+
+  el.insertBefore(card, el.firstChild);
+  while (el.children.length > 20) el.removeChild(el.lastChild);
+}
+
+connectStream();
+loadMemory();
+loadTranscriptList();
+</script>
+
+</body>
+</html>

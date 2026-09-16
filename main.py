@@ -1,16 +1,21 @@
 import collections
+import html.parser
 import io
 import json
+import os
 import queue
+import random
 import re
 import threading
 import time
 import warnings
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*")
 
+import httpx
 from faster_whisper import WhisperModel
 from openai import OpenAI
 import numpy as np
@@ -52,7 +57,15 @@ SYSTEM_PROMPT = (
     "the conversation. You do have long-term memory: important facts get saved "
     "automatically and recalled in future conversations. If you don't know "
     "something about the user yet, say so plainly rather than claiming you "
-    "have no memory at all."
+    "have no memory at all. You also have tools to check the current date/"
+    "time, list/read files on the user's computer, search the web, fetch a "
+    "specific web page, and write or edit files. When you use a tool, "
+    "summarize what's useful from the result in your own words rather than "
+    "reciting it verbatim - especially file contents or web pages, which "
+    "can be long. Writing or editing a file always asks the user to "
+    "confirm out loud before it actually happens, automatically - so just "
+    "call the tool directly when asked to write or edit something, don't "
+    "ask for confirmation yourself first, that would just double up."
 )
 MEMORY_EXTRACTION_PROMPT = (
     "You maintain Gabbie's long-term memory about the user. You'll be given "
@@ -75,6 +88,12 @@ MEMORY_PATH = BASE_DIR / "memory.json"
 GOODBYE_WORDS = ("goodbye", "bye", "exit", "quit")
 GOODBYE_PATTERN = re.compile(r"\b(" + "|".join(GOODBYE_WORDS) + r")\b", re.IGNORECASE)
 SLEEP_PHRASES = ("stop listening", "go to sleep", "go back to sleep")
+# Checked in this order (negative first) when confirming a destructive
+# action - "no" wins over any accidental affirmative-sounding word nearby.
+NEGATIVE_WORDS = ("no", "nope", "don't", "do not", "stop", "cancel", "negative", "never mind")
+AFFIRMATIVE_WORDS = ("yes", "yeah", "yep", "yup", "sure", "go ahead", "do it", "confirm", "affirmative", "okay", "ok")
+NEGATIVE_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in NEGATIVE_WORDS) + r")\b", re.IGNORECASE)
+AFFIRMATIVE_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in AFFIRMATIVE_WORDS) + r")\b", re.IGNORECASE)
 # faster-whisper hears "Gabbie" a few different ways in practice.
 WAKE_WORDS = ("gabbie", "gabby", "gabi", "gaby")
 WAKE_PATTERN = re.compile(r"\b(" + "|".join(WAKE_WORDS) + r")\b", re.IGNORECASE)
@@ -135,6 +154,14 @@ def contains_wake_word(text):
 def contains_sleep_phrase(text):
     lowered = text.lower()
     return any(phrase in lowered for phrase in SLEEP_PHRASES)
+
+
+def contains_negative(text):
+    return bool(NEGATIVE_PATTERN.search(text))
+
+
+def contains_affirmative(text):
+    return bool(AFFIRMATIVE_PATTERN.search(text))
 
 
 def transcribe(whisper, audio):
@@ -242,6 +269,339 @@ def remember_worker(client, memory_lock, events, recent_messages):
         MEMORY_PATH.write_text(json.dumps(existing, indent=2))
 
 
+MAX_TOOL_ROUNDS = 3
+MAX_FILE_CHARS = 4000
+MAX_DIRECTORY_ENTRIES = 100
+MAX_FETCH_CHARS = 6000
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+# The model doesn't reliably say anything before calling a tool (sometimes
+# it's dead silence straight into the tool call), and using a tool costs a
+# full extra LLM round-trip - so guarantee an acknowledgment instead of
+# leaving the user wondering if she heard them.
+TOOL_FILLER_PHRASES = (
+    "One sec, let me check.",
+    "Hold on, checking that now.",
+    "Let me take a look.",
+    "Give me just a moment.",
+)
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_datetime",
+            "description": "Get the current local date and time.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories in a directory on "
+            "the user's computer. Defaults to their home directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Directory path"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the text contents of a file on the user's computer.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path to the file"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information. Returns "
+            "a short list of results (title, snippet, URL).",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch a specific web page and return its readable text content.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "The http(s) URL to fetch"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create a file or overwrite an existing one with new "
+            "content on the user's computer. Always asks the user to confirm "
+            "out loud first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "Full text content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace one exact, unique piece of text in an "
+            "existing file on the user's computer with new text. Always asks "
+            "the user to confirm out loud first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "old_text": {"type": "string", "description": "Exact text to replace, must be unique in the file"},
+                    "new_text": {"type": "string", "description": "Text to replace it with"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+]
+
+# Tools that change something on disk - always confirmed out loud before
+# they actually run, since voice input is lossy and there's no click-to-
+# confirm UI to catch a mis-transcribed request before it does something
+# irreversible.
+DESTRUCTIVE_TOOLS = {"write_file", "edit_file"}
+
+
+def _resolve_path(path):
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else Path.home() / p
+
+
+def tool_get_current_datetime(**_kwargs):
+    return datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
+
+
+def tool_list_directory(path=None, **_kwargs):
+    p = _resolve_path(path) if path else Path.home()
+    try:
+        entries = sorted(p.iterdir())
+    except FileNotFoundError:
+        return f"Error: no such directory: {p}"
+    except NotADirectoryError:
+        return f"Error: not a directory: {p}"
+    except PermissionError:
+        return f"Error: permission denied: {p}"
+    if not entries:
+        return f"{p} is empty."
+    names = [e.name + ("/" if e.is_dir() else "") for e in entries[:MAX_DIRECTORY_ENTRIES]]
+    listing = f"Contents of {p}:\n" + "\n".join(names)
+    if len(entries) > MAX_DIRECTORY_ENTRIES:
+        listing += f"\n[...{len(entries) - MAX_DIRECTORY_ENTRIES} more not shown]"
+    return listing
+
+
+def tool_read_file(path=None, **_kwargs):
+    if not path:
+        return "Error: no path given"
+    p = _resolve_path(path)
+    try:
+        text = p.read_text(errors="replace")
+    except FileNotFoundError:
+        return f"Error: no such file: {p}"
+    except IsADirectoryError:
+        return f"Error: {p} is a directory, not a file"
+    except PermissionError:
+        return f"Error: permission denied: {p}"
+    if len(text) > MAX_FILE_CHARS:
+        return text[:MAX_FILE_CHARS] + f"\n\n[...truncated, {len(text)} characters total]"
+    return text
+
+
+class _TextExtractor(html.parser.HTMLParser):
+    """Bare-bones HTML-to-text: drops tags/script/style, keeps the rest.
+    Good enough for an LLM to summarize from - not a real readability
+    extractor, and doesn't need to be for that."""
+
+    def __init__(self):
+        super().__init__()
+        self._skip = False
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            text = data.strip()
+            if text:
+                self.parts.append(text)
+
+
+def _html_to_text(html_content):
+    parser = _TextExtractor()
+    parser.feed(html_content)
+    return "\n".join(parser.parts)
+
+
+def tool_fetch_url(url=None, **_kwargs):
+    if not url:
+        return "Error: no url given"
+    scheme = urlparse(url).scheme
+    if scheme not in ("http", "https"):
+        return f"Error: unsupported URL scheme: {scheme or '(none)'}"
+    try:
+        response = httpx.get(
+            url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, follow_redirects=True
+        )
+    except httpx.HTTPError as e:
+        return f"Error fetching {url}: {e}"
+    if response.status_code >= 400:
+        return f"Error: {url} returned HTTP {response.status_code}"
+    content_type = response.headers.get("content-type", "")
+    if "html" in content_type:
+        text = _html_to_text(response.text).strip()
+    elif "text" in content_type or not content_type:
+        text = response.text.strip()
+    else:
+        return f"Error: {url} isn't a text/HTML page (content-type: {content_type})"
+    if not text:
+        return f"{url} returned no readable text content."
+    if len(text) > MAX_FETCH_CHARS:
+        text = text[:MAX_FETCH_CHARS] + f"\n\n[...truncated, {len(text)} characters total]"
+    return text, {"url": url}
+
+
+def tool_web_search(query=None, **_kwargs):
+    if not query:
+        return "Error: no query given"
+    if not BRAVE_API_KEY:
+        return "Error: web search isn't set up yet - no BRAVE_API_KEY configured."
+    try:
+        response = httpx.get(
+            BRAVE_SEARCH_URL,
+            params={"q": query, "count": 5},
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+            timeout=10,
+        )
+    except httpx.HTTPError as e:
+        return f"Error searching: {e}"
+    if response.status_code != 200:
+        return f"Error: search returned HTTP {response.status_code}"
+    results = response.json().get("web", {}).get("results", [])
+    if not results:
+        return f"No search results for '{query}'."
+    lines = []
+    structured = []
+    for r in results[:5]:
+        title = r.get("title", "")
+        description = re.sub(r"<[^>]+>", "", r.get("description", ""))
+        url = r.get("url", "")
+        lines.append(f"- {title}: {description} ({url})")
+        structured.append({"title": title, "description": description, "url": url})
+    return "\n".join(lines), {"query": query, "results": structured}
+
+
+def tool_write_file(path=None, content=None, **_kwargs):
+    if not path:
+        return "Error: no path given"
+    if content is None:
+        return "Error: no content given"
+    p = _resolve_path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    except PermissionError:
+        return f"Error: permission denied: {p}"
+    except OSError as e:
+        return f"Error writing {p}: {e}"
+    return f"Wrote {len(content)} characters to {p}."
+
+
+def tool_edit_file(path=None, old_text=None, new_text=None, **_kwargs):
+    if not path:
+        return "Error: no path given"
+    if old_text is None or new_text is None:
+        return "Error: need both old_text and new_text"
+    p = _resolve_path(path)
+    try:
+        current = p.read_text()
+    except FileNotFoundError:
+        return f"Error: no such file: {p}"
+    except PermissionError:
+        return f"Error: permission denied: {p}"
+    count = current.count(old_text)
+    if count == 0:
+        return f"Error: that exact text was not found in {p}"
+    if count > 1:
+        return f"Error: that text appears {count} times in {p} - it must be unique. Include more surrounding context."
+    try:
+        p.write_text(current.replace(old_text, new_text, 1))
+    except PermissionError:
+        return f"Error: permission denied: {p}"
+    return f"Replaced the text in {p}."
+
+
+def describe_tool_action(name, kwargs):
+    path = kwargs.get("path", "(unknown path)")
+    if name == "write_file":
+        return f"I want to write to the file {path}."
+    if name == "edit_file":
+        return f"I want to edit the file {path}."
+    return f"I want to run {name}."
+
+
+TOOL_FUNCTIONS = {
+    "get_current_datetime": tool_get_current_datetime,
+    "list_directory": tool_list_directory,
+    "read_file": tool_read_file,
+    "web_search": tool_web_search,
+    "fetch_url": tool_fetch_url,
+    "write_file": tool_write_file,
+    "edit_file": tool_edit_file,
+}
+
+
+def execute_tool(name, arguments_json):
+    """Returns (text_for_the_model, extra_for_display). extra_for_display is
+    None unless the tool has something worth showing visually (e.g. search
+    results) - most tools just return a plain string, normalized here."""
+    try:
+        kwargs = json.loads(arguments_json) if arguments_json else {}
+    except json.JSONDecodeError:
+        kwargs = {}
+    func = TOOL_FUNCTIONS.get(name)
+    if not func:
+        return f"Error: unknown tool '{name}'", None
+    try:
+        result = func(**kwargs)
+    except Exception as e:
+        return f"Error running {name}: {e}", None
+    if isinstance(result, tuple):
+        return result
+    return str(result), None
+
+
 def speak(client, listening_enabled, audio_queue, events, text):
     """Speak a short, fixed line (no streaming needed)."""
     listening_enabled.clear()
@@ -257,7 +617,34 @@ def speak(client, listening_enabled, audio_queue, events, text):
         listening_enabled.set()
 
 
-def think_and_speak(client, listening_enabled, audio_queue, events, messages):
+def confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisper, description):
+    """Speaks the proposed action and blocks until a clear yes/no comes
+    back. Runs on the same thread that owns audio playback (see the
+    "confirm" branch in think_and_speak's draining loop below) - never call
+    this from a background thread, since sd.play() isn't safe to call
+    concurrently from two threads at once."""
+    prompt = f"{description} Should I go ahead?"
+    log(f"Gabbie: {prompt}")
+    events.publish("confirming", description=description)
+    speak(client, listening_enabled, audio_queue, events, prompt)
+    for _ in range(2):
+        audio = listen_for_utterance(vad, audio_queue)
+        if audio.size < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
+            continue
+        text = transcribe(whisper, audio)
+        if not text:
+            continue
+        log(f"[confirmation response] {text}")
+        if contains_negative(text):
+            return False
+        if contains_affirmative(text):
+            return True
+        speak(client, listening_enabled, audio_queue, events, "Sorry, was that a yes or a no?")
+    log("[confirmation] no clear answer, defaulting to no")
+    return False
+
+
+def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper, messages):
     """Stream the LLM reply, synthesizing and playing each sentence as soon
     as it's complete instead of waiting for the whole reply. Returns the
     full reply text once everything has finished playing."""
@@ -274,12 +661,15 @@ def think_and_speak(client, listening_enabled, audio_queue, events, messages):
             # meaningful fraction of turns - confirmed via a side-by-side
             # test: 5/10 suspect replies at temp=1.0 vs 0/10 at temp=0.6,
             # personality intact. Overriding it here for reliability.
-            for attempt in range(2):
+            empty_retries_left = 2
+            for _round in range(MAX_TOOL_ROUNDS + 2):
                 parts = []
                 buffer = ""
+                tool_calls = {}
                 llm_stream = client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=messages,
+                    tools=TOOLS,
                     stream=True,
                     temperature=0.6,
                     # This model "thinks" before answering by default, which
@@ -290,11 +680,23 @@ def think_and_speak(client, listening_enabled, audio_queue, events, messages):
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 for chunk in llm_stream:
-                    delta = chunk.choices[0].delta.content
-                    if not delta:
+                    delta = chunk.choices[0].delta
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            entry = tool_calls.setdefault(
+                                tc.index, {"id": None, "name": "", "arguments": ""}
+                            )
+                            if tc.id:
+                                entry["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                entry["name"] += tc.function.name
+                            if tc.function and tc.function.arguments:
+                                entry["arguments"] += tc.function.arguments
+                    content = delta.content
+                    if not content:
                         continue
-                    parts.append(delta)
-                    buffer += delta
+                    parts.append(content)
+                    buffer += content
                     if "<think>" in buffer and "</think>" not in buffer:
                         continue  # mid leaked-reasoning block; wait for it to close
                     buffer = re.sub(r"<think>.*?</think>", "", buffer, flags=re.DOTALL)
@@ -313,10 +715,67 @@ def think_and_speak(client, listening_enabled, audio_queue, events, messages):
                 # conversation history or the transcript, even though it's
                 # already kept out of what actually gets spoken above.
                 full_reply = re.sub(r"<think>.*?</think>", "", "".join(parts), flags=re.DOTALL)
-                full_reply = re.sub(r"<think>.*$", "", full_reply, flags=re.DOTALL)
-                full_text["reply"] = full_reply.strip()
-                if full_text["reply"]:
+                full_reply = re.sub(r"<think>.*$", "", full_reply, flags=re.DOTALL).strip()
+
+                if tool_calls:
+                    if not full_reply:
+                        sentence_queue.put(random.choice(TOOL_FILLER_PHRASES))
+                    ordered = [tool_calls[i] for i in sorted(tool_calls)]
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": full_reply or None,
+                            "tool_calls": [
+                                {
+                                    "id": c["id"],
+                                    "type": "function",
+                                    "function": {"name": c["name"], "arguments": c["arguments"]},
+                                }
+                                for c in ordered
+                            ],
+                        }
+                    )
+                    for c in ordered:
+                        log(f"[tool] {c['name']}({c['arguments']})")
+                        if c["name"] in DESTRUCTIVE_TOOLS:
+                            try:
+                                call_kwargs = json.loads(c["arguments"]) if c["arguments"] else {}
+                            except json.JSONDecodeError:
+                                call_kwargs = {}
+                            description = describe_tool_action(c["name"], call_kwargs)
+                            # Confirmation needs to speak and listen, which
+                            # must happen on the thread that owns audio
+                            # playback - not here (this is a background
+                            # thread) - so hand it to the draining loop
+                            # below and block for its answer.
+                            response_box = queue.Queue(maxsize=1)
+                            clip_queue.put(("confirm", (description, response_box)))
+                            approved = response_box.get()
+                            if approved:
+                                result_text, result_extra = execute_tool(c["name"], c["arguments"])
+                            else:
+                                result_text, result_extra = (
+                                    "The user did not confirm this action, so it was not performed.",
+                                    None,
+                                )
+                        else:
+                            result_text, result_extra = execute_tool(c["name"], c["arguments"])
+                        events.publish(
+                            "tool_call",
+                            name=c["name"],
+                            arguments=c["arguments"],
+                            result=result_text,
+                            extra=result_extra,
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": c["id"], "content": result_text}
+                        )
+                    continue  # go around again for the real answer now that tools ran
+
+                full_text["reply"] = full_reply
+                if full_reply or empty_retries_left <= 0:
                     break
+                empty_retries_left -= 1
                 log("[empty reply, retrying]")
             sentence_queue.put(None)
 
@@ -327,7 +786,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, messages):
                     clip_queue.put(None)
                     return
                 audio, sr = synthesize(client, sentence)
-                clip_queue.put((sentence, audio, sr))
+                clip_queue.put(("clip", (sentence, audio, sr)))
 
         threading.Thread(target=llm_worker, daemon=True).start()
         threading.Thread(target=tts_worker, daemon=True).start()
@@ -335,14 +794,28 @@ def think_and_speak(client, listening_enabled, audio_queue, events, messages):
         first_clip_at = None
         t0 = time.time()
         while True:
-            clip = clip_queue.get()
-            if clip is None:
+            item = clip_queue.get()
+            if item is None:
                 break
+            kind, payload = item
+            if kind == "confirm":
+                if first_clip_at is None:
+                    # The confirmation question is genuinely the first thing
+                    # spoken this turn - count it, so the timer below doesn't
+                    # make a real, already-spoken prompt look like dead air.
+                    first_clip_at = time.time()
+                    log(f"[first audio after {first_clip_at - t0:.1f}s]")
+                    events.publish("first_audio", seconds=round(first_clip_at - t0, 1))
+                description, response_box = payload
+                response_box.put(
+                    confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisper, description)
+                )
+                continue
+            sentence, audio, sr = payload
             if first_clip_at is None:
                 first_clip_at = time.time()
                 log(f"[first audio after {first_clip_at - t0:.1f}s]")
                 events.publish("first_audio", seconds=round(first_clip_at - t0, 1))
-            sentence, audio, sr = clip
             log(f"Gabbie: {sentence}")
             events.publish("speaking", text=sentence)
             sd.play(audio, sr)
@@ -478,7 +951,9 @@ def main():
                 log("[thinking + speaking]")
                 events.publish("thinking")
                 t0 = time.time()
-                reply = think_and_speak(client, listening_enabled, audio_queue, events, messages)
+                reply = think_and_speak(
+                    client, listening_enabled, audio_queue, events, vad, whisper, messages
+                )
                 # Start the awake window now that the mic is live again,
                 # rather than from when the user last spoke - otherwise a
                 # long reply (mic muted the whole time) eats into their
