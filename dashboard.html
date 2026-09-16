@@ -69,10 +69,10 @@
         </div>
         <div class="col-lg-5">
           <div class="card">
-            <div class="card-header">Web Activity</div>
+            <div class="card-header">Tool Activity</div>
             <div class="card-body">
               <div id="web-activity" class="scroll-panel">
-                <p class="text-secondary small mb-0">Nothing yet - ask Gabbie to search or fetch something.</p>
+                <p class="text-secondary small mb-0">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>
               </div>
             </div>
           </div>
@@ -392,10 +392,16 @@ function safeUrl(url) {
 }
 
 // --- Web Activity ---
+const TOOL_ICONS = {
+  get_current_datetime: "🕒",
+  list_directory: "📁",
+  read_file: "📄",
+  write_file: "✏️",
+  edit_file: "✏️",
+};
+
 function renderToolCall(evt) {
   const el = document.getElementById("web-activity");
-  // other tools aren't screen-shaped
-  if (!["web_search", "image_search", "view_image", "fetch_url"].includes(evt.name)) return;
   const placeholder = el.querySelector(".text-secondary.small");
   if (placeholder) el.innerHTML = "";
 
@@ -440,7 +446,17 @@ function renderToolCall(evt) {
       <div class="fw-semibold mb-1">🌐 Fetched</div>
       <a href="${safeUrl(evt.extra.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(evt.extra.url)}</a>`;
   } else {
-    return; // an error result with no structured data - nothing to show visually
+    // Generic fallback: file ops, the clock, a declined write/edit
+    // confirmation, or any tool call (including the ones above) that
+    // didn't come with its usual structured extra - e.g. an error -
+    // still worth seeing rather than silently dropped.
+    const icon = TOOL_ICONS[evt.name] || "🔧";
+    const label = evt.name.replace(/_/g, " ");
+    const result = evt.result || "";
+    const truncated = result.length > 400 ? result.slice(0, 400) + "…" : result;
+    card.innerHTML = `
+      <div class="fw-semibold mb-1">${icon} ${escapeHtml(label)}</div>
+      <div class="text-secondary small" style="white-space: pre-wrap;">${escapeHtml(truncated)}</div>`;
   }
 
   el.insertBefore(card, el.firstChild);
