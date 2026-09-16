@@ -35,6 +35,7 @@
       <span id="dot"></span> Gabbie
     </span>
     <span id="state" class="text-secondary text-capitalize small">disconnected</span>
+    <span id="mood" class="ms-2" style="font-size: 1.1rem; cursor: default;"></span>
     <span id="lastline" class="text-secondary small ms-auto text-truncate"></span>
   </div>
 </nav>
@@ -152,6 +153,9 @@ function connectStream() {
       case "tool_call":
         renderToolCall(evt);
         break;
+      case "mood":
+        setMood(evt.value, evt.label);
+        break;
     }
   };
   es.onerror = () => {
@@ -160,6 +164,19 @@ function connectStream() {
     es.close();
     setTimeout(connectStream, 2000);
   };
+}
+
+// --- Mood ---
+function setMood(value, label) {
+  const el = document.getElementById("mood");
+  const emoji = value >= 3 ? "😄" : value >= 1 ? "🙂" : value <= -3 ? "😔" : value <= -1 ? "😕" : "😐";
+  el.textContent = emoji;
+  el.title = label ? `Mood: ${label} (${value})` : `Mood: neutral (${value})`;
+}
+
+async function loadMood() {
+  const data = await fetch("/api/mood").then((r) => r.json());
+  setMood(data.value, data.label);
 }
 
 // --- Memory ---
@@ -343,6 +360,7 @@ lightboxEl.addEventListener("keydown", (e) => {
 
 connectStream();
 loadMemory();
+loadMood();
 loadTranscriptList();
 </script>
 

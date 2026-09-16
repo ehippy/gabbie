@@ -83,12 +83,22 @@ MEMORY_EXTRACTION_PROMPT = (
     '- "remove": any CURRENT facts this conversation shows are now wrong, '
     "corrected, or outdated. Copy them EXACTLY as given so they can be "
     "matched.\n"
-    'Reply with ONLY JSON: {"add": [...], "remove": [...]}. Use empty '
-    "arrays for either if there's nothing to add or remove."
+    '- "mood_delta": how this conversation felt for Gabbie herself, as an '
+    "integer from -2 to 2. Warmth, compliments, playfulness, or a fun "
+    "exchange should nudge it positive; rudeness, dismissiveness, or "
+    "curtness directed at her should nudge it negative. Use 0 for a "
+    "neutral or purely transactional exchange - don't invent a shift that "
+    "isn't there.\n"
+    'Reply with ONLY JSON: {"add": [...], "remove": [...], "mood_delta": '
+    "0}. Use empty arrays for add/remove if there's nothing to add or "
+    "remove."
 )
 BASE_DIR = Path(__file__).resolve().parent
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
 MEMORY_PATH = BASE_DIR / "memory.json"
+MOOD_PATH = BASE_DIR / "mood.json"
+MOOD_MIN, MOOD_MAX = -5, 5
+MOOD_HALF_LIFE_HOURS = 6  # how fast an untouched mood drifts back to neutral
 GOODBYE_WORDS = ("goodbye", "bye", "exit", "quit")
 GOODBYE_PATTERN = re.compile(r"\b(" + "|".join(GOODBYE_WORDS) + r")\b", re.IGNORECASE)
 SLEEP_PHRASES = ("stop listening", "go to sleep", "go back to sleep")
@@ -193,11 +203,55 @@ def load_memory():
         return []
 
 
-def build_system_prompt(facts):
-    if not facts:
-        return SYSTEM_PROMPT
-    bullets = "\n".join(f"- {f['fact']}" for f in facts)
-    return f"{SYSTEM_PROMPT}\n\nThings you remember from previous conversations:\n{bullets}"
+def load_mood():
+    """Current mood, decayed toward neutral (0) based on how long it's
+    been since the last update - so a good or bad mood fades on its own
+    rather than sticking around forever."""
+    if not MOOD_PATH.exists():
+        return 0.0
+    try:
+        data = json.loads(MOOD_PATH.read_text())
+        value = float(data["value"])
+        ts = datetime.fromisoformat(data["ts"])
+    except (json.JSONDecodeError, OSError, KeyError, ValueError):
+        return 0.0
+    elapsed_hours = max(0.0, (datetime.now() - ts).total_seconds() / 3600)
+    return value * (0.5 ** (elapsed_hours / MOOD_HALF_LIFE_HOURS))
+
+
+def save_mood(value):
+    value = max(MOOD_MIN, min(MOOD_MAX, value))
+    MOOD_PATH.write_text(json.dumps({"value": round(value, 2), "ts": datetime.now().isoformat()}))
+    return value
+
+
+def mood_label(value):
+    """None means near-neutral - not worth mentioning in the prompt or
+    showing as anything but a plain, wordless indicator on the dashboard."""
+    if value >= 3:
+        return "cheerful and extra playful"
+    if value >= 1:
+        return "in a good mood"
+    if value <= -3:
+        return "a bit low, but still warm and helpful"
+    if value <= -1:
+        return "a little subdued"
+    return None
+
+
+def build_system_prompt(facts, mood=0.0):
+    prompt = SYSTEM_PROMPT
+    label = mood_label(mood)
+    if label:
+        prompt += (
+            f"\n\nRight now you're feeling {label} - let that color your "
+            "tone naturally without announcing it, unless the user asks "
+            "how you're doing."
+        )
+    if facts:
+        bullets = "\n".join(f"- {f['fact']}" for f in facts)
+        prompt += f"\n\nThings you remember from previous conversations:\n{bullets}"
+    return prompt
 
 
 def open_transcript():
@@ -247,15 +301,23 @@ def extract_memory_updates(client, current_facts, recent_messages):
         data = json.loads(raw)
         add = [f.strip() for f in data.get("add", []) if isinstance(f, str) and f.strip()]
         remove = [f.strip() for f in data.get("remove", []) if isinstance(f, str) and f.strip()]
-        return add, remove
+        try:
+            mood_delta = max(-2, min(2, int(data.get("mood_delta", 0))))
+        except (TypeError, ValueError):
+            mood_delta = 0
+        return add, remove, mood_delta
     except Exception:
-        return [], []
+        return [], [], 0
 
 
 def remember_worker(client, memory_lock, events, recent_messages):
     with memory_lock:
         current_facts = [f["fact"] for f in load_memory()]
-    add, remove = extract_memory_updates(client, current_facts, recent_messages)
+    add, remove, mood_delta = extract_memory_updates(client, current_facts, recent_messages)
+    if mood_delta:
+        new_mood = save_mood(load_mood() + mood_delta)
+        log(f"[mood] {mood_delta:+d} -> {new_mood:.1f}")
+        events.publish("mood", value=round(new_mood, 2), label=mood_label(new_mood))
     if not add and not remove:
         return
     with memory_lock:
@@ -992,12 +1054,22 @@ def main():
     remembered_facts = load_memory()
     if remembered_facts:
         log(f"Loaded {len(remembered_facts)} remembered fact(s).")
-    messages = [{"role": "system", "content": build_system_prompt(remembered_facts)}]
+    mood = load_mood()
+    if mood_label(mood):
+        log(f"[mood] starting at {mood:.1f} ({mood_label(mood)})")
+    messages = [{"role": "system", "content": build_system_prompt(remembered_facts, mood)}]
     transcript_path = open_transcript()
     awake_until = 0.0
     remember_thread = None
     last_extracted_index = len(messages)
     log("Gabbie is listening... (Ctrl+C to quit)")
+
+    def refresh_system_prompt():
+        # Facts and mood can both change mid-session (remember_worker runs
+        # in the background) - rebuild the live system prompt from current
+        # disk state rather than letting it go stale until the next
+        # restart.
+        messages[0]["content"] = build_system_prompt(load_memory(), load_mood())
 
     def flush_memory_async():
         nonlocal remember_thread, last_extracted_index
@@ -1007,9 +1079,12 @@ def main():
             return
         context = messages[last_extracted_index:]
         last_extracted_index = len(messages)
-        remember_thread = threading.Thread(
-            target=remember_worker, args=(client, memory_lock, events, context), daemon=True
-        )
+
+        def run():
+            remember_worker(client, memory_lock, events, context)
+            refresh_system_prompt()
+
+        remember_thread = threading.Thread(target=run, daemon=True)
         remember_thread.start()
 
     def flush_memory_sync():
@@ -1019,6 +1094,7 @@ def main():
         if len(messages) > last_extracted_index:
             remember_worker(client, memory_lock, events, messages[last_extracted_index:])
             last_extracted_index = len(messages)
+            refresh_system_prompt()
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,

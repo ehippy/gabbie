@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from eventbus import HOST as GABBIE_HOST, PORT as GABBIE_PORT
-from main import MEMORY_PATH, TRANSCRIPTS_DIR, load_memory
+from main import MEMORY_PATH, TRANSCRIPTS_DIR, load_memory, load_mood, mood_label
 
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8766
@@ -105,6 +105,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/memory":
             self._send_json(load_memory())
+            return
+
+        if path == "/api/mood":
+            value = load_mood()
+            self._send_json({"value": round(value, 2), "label": mood_label(value)})
             return
 
         if path == "/api/transcripts":

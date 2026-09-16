@@ -4,3 +4,4 @@ __pycache__/
 *.wav
 transcripts/
 memory.json
+mood.json
