@@ -21,8 +21,7 @@
   .dot-thinking { background-color: var(--bs-warning) !important; }
   .dot-speaking { background-color: var(--bs-primary) !important; }
   .dot-sleeping { background-color: #8850c8 !important; }
-  .scroll-panel { max-height: 480px; overflow-y: auto; }
-  #lastline { max-width: 45%; }
+  .scroll-panel { max-height: 65vh; overflow-y: auto; }
   .msg .role.user { color: var(--bs-info); }
   .msg .role.assistant { color: var(--bs-success); }
 </style>
@@ -36,15 +35,50 @@
     </span>
     <span id="state" class="text-secondary text-capitalize small">disconnected</span>
     <span id="mood" class="ms-2" style="font-size: 1.1rem; cursor: default;"></span>
-    <span id="lastline" class="text-secondary small ms-auto text-truncate"></span>
   </div>
 </nav>
 
 <div class="container-fluid">
-  <div class="row g-4">
-    <div class="col-lg-5">
+  <ul class="nav nav-tabs mb-4" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pane-conversation" type="button">Conversation</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-memory" type="button">Memory</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-transcripts" type="button">Transcripts</button>
+    </li>
+  </ul>
+
+  <div class="tab-content">
+    <div class="tab-pane fade show active" id="pane-conversation" role="tabpanel">
+      <div class="row g-4">
+        <div class="col-lg-7">
+          <div class="card">
+            <div class="card-header">Live</div>
+            <div class="card-body">
+              <div id="live-conversation" class="scroll-panel">
+                <p class="text-secondary small mb-0">Nothing yet - say the wake word to start.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-5">
+          <div class="card">
+            <div class="card-header">Web Activity</div>
+            <div class="card-body">
+              <div id="web-activity" class="scroll-panel">
+                <p class="text-secondary small mb-0">Nothing yet - ask Gabbie to search or fetch something.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-pane fade" id="pane-memory" role="tabpanel">
       <div class="card">
-        <div class="card-header">Memory</div>
         <div class="card-body">
           <div id="memory-list" class="list-group list-group-flush scroll-panel">
             <p class="text-secondary small mb-0">Loading...</p>
@@ -53,9 +87,8 @@
       </div>
     </div>
 
-    <div class="col-lg-7">
+    <div class="tab-pane fade" id="pane-transcripts" role="tabpanel">
       <div class="card">
-        <div class="card-header">Transcripts</div>
         <div class="card-body">
           <div class="row">
             <div class="col-4 border-end">
@@ -68,19 +101,6 @@
                 <p class="text-secondary small mb-0">Pick a session to view it.</p>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="row g-4 mt-1">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header">Web Activity</div>
-        <div class="card-body">
-          <div id="web-activity" class="scroll-panel">
-            <p class="text-secondary small mb-0">Nothing yet - ask Gabbie to search or fetch something.</p>
           </div>
         </div>
       </div>
@@ -116,10 +136,6 @@ function setStatus(state) {
   dot.classList.add("dot-" + state);
 }
 
-function setLastLine(text) {
-  document.getElementById("lastline").textContent = text;
-}
-
 // --- Live status ---
 function connectStream() {
   const es = new EventSource("/api/status/stream");
@@ -134,11 +150,11 @@ function connectStream() {
         setStatus(evt.event);
         break;
       case "heard":
-        if (!evt.ignored) setLastLine("You: " + evt.text);
+        if (!evt.ignored) appendConversationLine("user", evt.text);
         break;
       case "speaking":
         setStatus("speaking");
-        setLastLine("Gabbie: " + evt.text);
+        appendConversationLine("assistant", evt.text);
         break;
       case "done_speaking":
         setStatus("listening");
@@ -160,10 +176,26 @@ function connectStream() {
   };
   es.onerror = () => {
     setStatus("disconnected");
-    setLastLine("");
     es.close();
     setTimeout(connectStream, 2000);
   };
+}
+
+// --- Conversation ---
+function appendConversationLine(role, text) {
+  const el = document.getElementById("live-conversation");
+  const placeholder = el.querySelector(".text-secondary.small");
+  if (placeholder) el.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "msg mb-2";
+  const roleClass = role === "user" ? "user" : "assistant";
+  const roleLabel = role === "user" ? "You" : "Gabbie";
+  div.innerHTML = `
+    <span class="role ${roleClass} fw-semibold small">${roleLabel}</span>
+    <span class="text-secondary" style="font-size: 0.75rem;">${new Date().toLocaleTimeString()}</span>
+    <div>${escapeHtml(text)}</div>`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
 }
 
 // --- Mood ---
