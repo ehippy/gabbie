@@ -55,13 +55,20 @@ SYSTEM_PROMPT = (
     "personal or new about themselves, warmly acknowledge THAT SPECIFIC "
     "thing in your own words, briefly - never a flat, clinical 'Noted' or "
     "'Fair', and never a stock phrase or an unrelated fact from earlier in "
-    "the conversation. You do have long-term memory: important facts get saved "
-    "automatically and recalled in future conversations. If you don't know "
-    "something about the user yet, say so plainly rather than claiming you "
-    "have no memory at all. You also have tools to check the current date/"
-    "time, list/read files on the user's computer, search the web, fetch a "
-    "specific web page, search for images, actually look at one of those "
-    "images, and write or edit files. image_search only surfaces results "
+    "the conversation. You have long-term memory tools - remember, "
+    "list_memories, edit_memory, forget_memory - covered below; if you "
+    "don't know something about the user yet, say so plainly rather than "
+    "claiming you have no memory at all. You also have tools to check the "
+    "current date/time, manage that long-term memory, list/read files on "
+    "the user's computer, search the web, fetch a specific web page, "
+    "search for images, actually look at one of those images, and write "
+    "or edit files. Use remember in the moment whenever the user shares "
+    "something worth keeping long-term (name, preferences, ongoing "
+    "projects, decisions) - this doesn't happen on its own, so don't wait "
+    "or assume it's already been saved. If something you knew turns out "
+    "to be wrong or outdated, fix it with edit_memory or forget_memory "
+    "rather than leaving stale info around; use list_memories first if "
+    "you need the exact wording to do that. image_search only surfaces results "
     "on the local dashboard - you don't see them from that alone, so just "
     "acknowledge you've pulled them up rather than describing them. If the "
     "user then asks you to look at, describe, compare, or react to one of "
@@ -74,27 +81,15 @@ SYSTEM_PROMPT = (
     "call the tool directly when asked to write or edit something, don't "
     "ask for confirmation yourself first, that would just double up."
 )
-MEMORY_EXTRACTION_PROMPT = (
-    "You maintain Gabbie's long-term memory about the user. You'll be given "
-    "the CURRENT remembered facts and a recent conversation excerpt. Decide "
-    "what should change:\n"
-    '- "add": new durable facts worth remembering long-term (name, '
-    "preferences, ongoing projects, decisions) that aren't already covered "
-    "by a current fact. Use the excerpt for context to make facts "
-    "self-contained (e.g. resolve 'they' or 'nine and eleven' to what it "
-    "refers to).\n"
-    '- "remove": any CURRENT facts this conversation shows are now wrong, '
-    "corrected, or outdated. Copy them EXACTLY as given so they can be "
-    "matched.\n"
-    '- "mood_delta": how this conversation felt for Gabbie herself, as an '
-    "integer from -2 to 2. Warmth, compliments, playfulness, or a fun "
-    "exchange should nudge it positive; rudeness, dismissiveness, or "
-    "curtness directed at her should nudge it negative. Use 0 for a "
-    "neutral or purely transactional exchange - don't invent a shift that "
-    "isn't there.\n"
-    'Reply with ONLY JSON: {"add": [...], "remove": [...], "mood_delta": '
-    "0}. Use empty arrays for add/remove if there's nothing to add or "
-    "remove."
+MOOD_EXTRACTION_PROMPT = (
+    "You score how a conversation felt for Gabbie, a voice assistant. "
+    "You'll be given a recent conversation excerpt. Decide a mood_delta: "
+    "how this conversation felt for Gabbie herself, as an integer from -2 "
+    "to 2. Warmth, compliments, playfulness, or a fun exchange should "
+    "nudge it positive; rudeness, dismissiveness, or curtness directed at "
+    "her should nudge it negative. Use 0 for a neutral or purely "
+    "transactional exchange - don't invent a shift that isn't there.\n"
+    'Reply with ONLY JSON: {"mood_delta": 0}.'
 )
 BASE_DIR = Path(__file__).resolve().parent
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
@@ -306,12 +301,9 @@ def append_transcript(path, role, content):
         f.write(json.dumps(entry) + "\n")
 
 
-def extract_memory_updates(client, current_facts, recent_messages):
-    # A single isolated exchange often doesn't make sense on its own (e.g.
-    # "Nine and eleven" only means something next to "how old are they?"),
-    # so extraction gets a few turns of context instead of just the latest.
-    # It also gets the current facts so it can catch contradictions/updates
-    # (e.g. a correction) instead of just piling on duplicates forever.
+def extract_mood_delta(client, recent_messages):
+    # A single isolated exchange often doesn't make sense on its own, so
+    # this gets a few turns of context instead of just the latest.
     convo = "\n".join(
         f"{'User' if m['role'] == 'user' else 'Gabbie'}: {m['content']}"
         for m in recent_messages
@@ -321,62 +313,33 @@ def extract_memory_updates(client, current_facts, recent_messages):
         # None" lines.
         if m["role"] in ("user", "assistant") and m.get("content")
     )
-    current_block = "\n".join(f"- {f}" for f in current_facts) or "(none yet)"
-    user_content = f"Current known facts:\n{current_block}\n\nRecent conversation:\n{convo}"
     try:
         response = client.chat.completions.create(
             model=current_llm_model(),
             messages=[
-                {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
-                {"role": "user", "content": user_content},
+                {"role": "system", "content": MOOD_EXTRACTION_PROMPT},
+                {"role": "user", "content": f"Recent conversation:\n{convo}"},
             ],
             temperature=0.1,
             # Unlike the conversational reply path, this runs off the
             # latency-critical path (see the join() in main()), so it's
-            # worth leaving "thinking" enabled here - resolving something
-            # like "nine and eleven" back to "the kids' ages" needs it.
+            # worth leaving "thinking" enabled here.
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
-        add = [f.strip() for f in data.get("add", []) if isinstance(f, str) and f.strip()]
-        remove = [f.strip() for f in data.get("remove", []) if isinstance(f, str) and f.strip()]
-        try:
-            mood_delta = max(-2, min(2, int(data.get("mood_delta", 0))))
-        except (TypeError, ValueError):
-            mood_delta = 0
-        return add, remove, mood_delta
+        return max(-2, min(2, int(data.get("mood_delta", 0))))
     except Exception:
-        return [], [], 0
+        return 0
 
 
-def remember_worker(client, memory_lock, events, recent_messages):
-    with memory_lock:
-        current_facts = [f["fact"] for f in load_memory()]
-    add, remove, mood_delta = extract_memory_updates(client, current_facts, recent_messages)
-    if mood_delta:
-        new_mood = save_mood(load_mood() + mood_delta)
-        log(f"[mood] {mood_delta:+d} -> {new_mood:.1f}")
-        events.publish("mood", value=round(new_mood, 2), label=mood_label(new_mood))
-    if not add and not remove:
+def mood_worker(client, events, recent_messages):
+    mood_delta = extract_mood_delta(client, recent_messages)
+    if not mood_delta:
         return
-    with memory_lock:
-        existing = load_memory()
-        if remove:
-            remove_set = set(remove)
-            for f in existing:
-                if f["fact"] in remove_set:
-                    log(f"[forgot] {f['fact']}")
-                    events.publish("forgot", fact=f["fact"])
-            existing = [f for f in existing if f["fact"] not in remove_set]
-        known = {f["fact"] for f in existing}
-        for fact in add:
-            if fact not in known:
-                existing.append({"fact": fact, "ts": datetime.now().isoformat()})
-                known.add(fact)
-                log(f"[remembered] {fact}")
-                events.publish("remembered", fact=fact)
-        MEMORY_PATH.write_text(json.dumps(existing, indent=2))
+    new_mood = save_mood(load_mood() + mood_delta)
+    log(f"[mood] {mood_delta:+d} -> {new_mood:.1f}")
+    events.publish("mood", value=round(new_mood, 2), label=mood_label(new_mood))
 
 
 MAX_TOOL_ROUNDS = 3
@@ -439,6 +402,71 @@ TOOLS = [
             "name": "get_current_datetime",
             "description": "Get the current local date and time.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Save a new fact to long-term memory. Do this "
+            "in the moment when the user shares something worth "
+            "remembering long-term (name, preferences, ongoing projects, "
+            "decisions) - don't wait for the conversation to end, and "
+            "don't rely on it happening on its own. Make the fact "
+            "self-contained (resolve pronouns and context) since it'll be "
+            "read back later with no surrounding conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "The fact to remember, as a standalone statement"}
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": "List everything currently remembered about "
+            "the user - use this to check what's already saved, avoid "
+            "saving a duplicate, or find the exact wording of something "
+            "before editing or forgetting it.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_memory",
+            "description": "Correct an existing memory - use when a "
+            "previously remembered fact turns out to be outdated or "
+            "wrong. old_fact must match a remembered fact exactly (use "
+            "list_memories first to get the exact wording).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_fact": {"type": "string", "description": "The exact existing fact to replace"},
+                    "new_fact": {"type": "string", "description": "The corrected fact"},
+                },
+                "required": ["old_fact", "new_fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": "Permanently remove a remembered fact - use "
+            "when the user asks you to forget something, or a fact is no "
+            "longer true and doesn't need a replacement. fact must match "
+            "a remembered fact exactly (use list_memories first to get "
+            "the exact wording).",
+            "parameters": {
+                "type": "object",
+                "properties": {"fact": {"type": "string", "description": "The exact fact to forget"}},
+                "required": ["fact"],
+            },
         },
     },
     {
@@ -583,6 +611,68 @@ def _resolve_path(path):
 
 def tool_get_current_datetime(**_kwargs):
     return datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
+
+
+def tool_remember(fact=None, events=None, **_kwargs):
+    if not fact or not fact.strip():
+        return "Error: no fact given"
+    fact = fact.strip()
+    existing = load_memory()
+    if any(f["fact"] == fact for f in existing):
+        return f"Already remembered: {fact}"
+    existing.append({"fact": fact, "ts": datetime.now().isoformat()})
+    MEMORY_PATH.write_text(json.dumps(existing, indent=2))
+    log(f"[remembered] {fact}")
+    if events:
+        events.publish("remembered", fact=fact)
+    return f"Remembered: {fact}"
+
+
+def tool_list_memories(**_kwargs):
+    facts = load_memory()
+    if not facts:
+        return "No memories saved yet."
+    return "\n".join(f"- {f['fact']}" for f in facts)
+
+
+def tool_edit_memory(old_fact=None, new_fact=None, events=None, **_kwargs):
+    if not old_fact or not new_fact:
+        return "Error: need both old_fact and new_fact"
+    old_fact, new_fact = old_fact.strip(), new_fact.strip()
+    facts = load_memory()
+    matches = [f for f in facts if f["fact"] == old_fact]
+    if not matches:
+        return f"Error: no memory matching '{old_fact}' - use list_memories to get the exact wording."
+    if len(matches) > 1:
+        return f"Error: '{old_fact}' matches more than one memory - this shouldn't normally happen."
+    for f in facts:
+        if f["fact"] == old_fact:
+            f["fact"] = new_fact
+            f["ts"] = datetime.now().isoformat()
+            break
+    MEMORY_PATH.write_text(json.dumps(facts, indent=2))
+    log(f"[remembered] {old_fact} -> {new_fact}")
+    if events:
+        events.publish("remembered", fact=new_fact)
+    return f"Updated memory: '{old_fact}' is now '{new_fact}'"
+
+
+def tool_forget_memory(fact=None, events=None, **_kwargs):
+    if not fact:
+        return "Error: no fact given"
+    fact = fact.strip()
+    facts = load_memory()
+    matches = [f for f in facts if f["fact"] == fact]
+    if not matches:
+        return f"Error: no memory matching '{fact}' - use list_memories to get the exact wording."
+    if len(matches) > 1:
+        return f"Error: '{fact}' matches more than one memory - this shouldn't normally happen."
+    remaining = [f for f in facts if f["fact"] != fact]
+    MEMORY_PATH.write_text(json.dumps(remaining, indent=2))
+    log(f"[forgot] {fact}")
+    if events:
+        events.publish("forgot", fact=fact)
+    return f"Forgot: {fact}"
 
 
 def tool_list_directory(path=None, **_kwargs):
@@ -883,6 +973,10 @@ def describe_tool_action(name, kwargs):
 
 TOOL_FUNCTIONS = {
     "get_current_datetime": tool_get_current_datetime,
+    "remember": tool_remember,
+    "list_memories": tool_list_memories,
+    "edit_memory": tool_edit_memory,
+    "forget_memory": tool_forget_memory,
     "list_directory": tool_list_directory,
     "read_file": tool_read_file,
     "web_search": tool_web_search,
@@ -894,12 +988,13 @@ TOOL_FUNCTIONS = {
 }
 
 
-def execute_tool(name, arguments_json, client=None):
+def execute_tool(name, arguments_json, client=None, events=None):
     """Returns (text_for_the_model, extra_for_display). extra_for_display is
     None unless the tool has something worth showing visually (e.g. search
     results) - most tools just return a plain string, normalized here.
-    client is only used by view_image (needs it for the vision call) -
-    every other tool ignores it via its **_kwargs catch-all."""
+    client is only used by view_image (needs it for the vision call) and
+    events only by the memory tools (to notify the dashboard) - every
+    other tool ignores both via its **_kwargs catch-all."""
     try:
         kwargs = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError:
@@ -908,7 +1003,7 @@ def execute_tool(name, arguments_json, client=None):
     if not func:
         return f"Error: unknown tool '{name}'", None
     try:
-        result = func(client=client, **kwargs)
+        result = func(client=client, events=events, **kwargs)
     except Exception as e:
         return f"Error running {name}: {e}", None
     if isinstance(result, tuple):
@@ -1074,14 +1169,18 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                             sentence_queue.put(("confirm", description, response_box))
                             approved = response_box.get()
                             if approved:
-                                result_text, result_extra = execute_tool(c["name"], c["arguments"], client=client)
+                                result_text, result_extra = execute_tool(
+                                    c["name"], c["arguments"], client=client, events=events
+                                )
                             else:
                                 result_text, result_extra = (
                                     "The user did not confirm this action, so it was not performed.",
                                     None,
                                 )
                         else:
-                            result_text, result_extra = execute_tool(c["name"], c["arguments"], client=client)
+                            result_text, result_extra = execute_tool(
+                                c["name"], c["arguments"], client=client, events=events
+                            )
                         events.publish(
                             "tool_call",
                             name=c["name"],
@@ -1196,7 +1295,6 @@ def main():
     whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
     client = OpenAI(base_url=NEURALFORGE_URL, api_key="not-needed")
     vad = webrtcvad.Vad(VAD_MODE)
-    memory_lock = threading.Lock()
 
     events = EventBus()
     if events.start():
@@ -1217,7 +1315,7 @@ def main():
     messages = [{"role": "system", "content": build_system_prompt(remembered_facts, mood)}]
     transcript_path = open_transcript()
     awake_until = 0.0
-    remember_thread = None
+    mood_thread = None
     last_extracted_index = len(messages)
     # Discard any reset request left over from before this process started -
     # "New Conversation" should only ever apply to a conversation that's
@@ -1226,15 +1324,15 @@ def main():
     log("Gabbie is listening... (Ctrl+C to quit)")
 
     def refresh_system_prompt():
-        # Facts and mood can both change mid-session (remember_worker runs
-        # in the background) - rebuild the live system prompt from current
-        # disk state rather than letting it go stale until the next
-        # restart.
+        # Memory facts change immediately when a memory tool runs, so this
+        # is really only for mood, which mood_worker updates in the
+        # background - rebuild the live system prompt from current disk
+        # state rather than letting mood go stale until the next restart.
         messages[0]["content"] = build_system_prompt(load_memory(), load_mood())
 
-    def flush_memory_async():
-        nonlocal remember_thread, last_extracted_index
-        if remember_thread and remember_thread.is_alive():
+    def flush_mood_async():
+        nonlocal mood_thread, last_extracted_index
+        if mood_thread and mood_thread.is_alive():
             return  # one already in flight; it'll pick up next time
         if len(messages) <= last_extracted_index:
             return
@@ -1242,18 +1340,18 @@ def main():
         last_extracted_index = len(messages)
 
         def run():
-            remember_worker(client, memory_lock, events, context)
+            mood_worker(client, events, context)
             refresh_system_prompt()
 
-        remember_thread = threading.Thread(target=run, daemon=True)
-        remember_thread.start()
+        mood_thread = threading.Thread(target=run, daemon=True)
+        mood_thread.start()
 
-    def flush_memory_sync():
+    def flush_mood_sync():
         nonlocal last_extracted_index
-        if remember_thread:
-            remember_thread.join()
+        if mood_thread:
+            mood_thread.join()
         if len(messages) > last_extracted_index:
-            remember_worker(client, memory_lock, events, messages[last_extracted_index:])
+            mood_worker(client, events, messages[last_extracted_index:])
             last_extracted_index = len(messages)
             refresh_system_prompt()
 
@@ -1271,7 +1369,7 @@ def main():
                 if RESET_FLAG_PATH.exists():
                     RESET_FLAG_PATH.unlink()
                     log("[new conversation requested]")
-                    flush_memory_sync()  # don't lose anything from the conversation being ended
+                    flush_mood_sync()  # don't lose the mood shift from the conversation being ended
                     messages[:] = [{"role": "system", "content": build_system_prompt(load_memory(), load_mood())}]
                     last_extracted_index = len(messages)
                     transcript_path = open_transcript()
@@ -1306,7 +1404,7 @@ def main():
                 if GOODBYE_PATTERN.search(text):
                     speak(client, listening_enabled, audio_queue, events, "Bye bye!")
                     append_transcript(transcript_path, "assistant", "Bye bye!")
-                    flush_memory_sync()
+                    flush_mood_sync()
                     events.publish("bye")
                     break
 
@@ -1317,16 +1415,16 @@ def main():
                     append_transcript(transcript_path, "assistant", "Okay, I'll be quiet.")
                     awake_until = 0.0
                     # Nobody's actively waiting on anything right now, so
-                    # catch up on memory in the background while she's quiet.
-                    flush_memory_async()
+                    # catch up on mood scoring in the background while she's quiet.
+                    flush_mood_async()
                     continue
 
-                # neuralforge's LLM only has one inference slot, so a memory
-                # extraction call left running would otherwise queue up
-                # behind (or in front of) this one and blow out latency.
-                if remember_thread and remember_thread.is_alive():
-                    log("[waiting for memory update to finish]")
-                    remember_thread.join()
+                # neuralforge's LLM only has one inference slot, so a mood
+                # scoring call left running would otherwise queue up behind
+                # (or in front of) this one and blow out latency.
+                if mood_thread and mood_thread.is_alive():
+                    log("[waiting for mood update to finish]")
+                    mood_thread.join()
 
                 messages.append({"role": "user", "content": text})
                 log("[thinking + speaking]")
@@ -1344,7 +1442,7 @@ def main():
                 append_transcript(transcript_path, "assistant", reply)
                 log(f"[done speaking]  ({time.time() - t0:.1f}s total)")
         except KeyboardInterrupt:
-            flush_memory_sync()
+            flush_mood_sync()
             raise
 
 
