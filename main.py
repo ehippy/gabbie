@@ -1351,6 +1351,7 @@ def main():
     messages = [{"role": "system", "content": build_system_prompt(remembered_facts, mood)}]
     transcript_path = resume_or_start_transcript()
     awake_until = 0.0
+    events.publish("awake", until=awake_until)
     mood_thread = None
     last_extracted_index = len(messages)
     # Discard any reset request left over from before this process started -
@@ -1410,6 +1411,7 @@ def main():
                     last_extracted_index = len(messages)
                     transcript_path = start_new_transcript()
                     awake_until = 0.0
+                    events.publish("awake", until=awake_until)
                     events.publish("new_conversation")
                     speak(client, listening_enabled, audio_queue, events, "Okay, starting fresh!")
                     append_transcript(transcript_path, "assistant", "Okay, starting fresh!")
@@ -1451,6 +1453,7 @@ def main():
                     speak(client, listening_enabled, audio_queue, events, "Okay, I'll be quiet.")
                     append_transcript(transcript_path, "assistant", "Okay, I'll be quiet.")
                     awake_until = 0.0
+                    events.publish("awake", until=awake_until)
                     # Nobody's actively waiting on anything right now, so
                     # catch up on mood scoring in the background while she's quiet.
                     flush_mood_async()
@@ -1475,6 +1478,7 @@ def main():
                 # long reply (mic muted the whole time) eats into their
                 # reply window before they even get a chance to respond.
                 awake_until = time.time() + AWAKE_WINDOW_SECONDS
+                events.publish("awake", until=awake_until)
                 messages.append({"role": "assistant", "content": reply})
                 append_transcript(transcript_path, "assistant", reply)
                 log(f"[done speaking]  ({time.time() - t0:.1f}s total)")

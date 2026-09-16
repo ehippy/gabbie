@@ -38,7 +38,13 @@
     transition: opacity 1.2s ease;
   }
   #ambient-glow.glow-listening {
+    /* awake - she'll respond to anything, no wake word needed */
     background: radial-gradient(ellipse at top, rgba(70, 190, 100, 0.5), transparent 65%);
+    animation: breathe 2.2s ease-in-out infinite;
+  }
+  #ambient-glow.glow-needs-wake {
+    /* listening, but only the wake word will get her attention */
+    background: radial-gradient(ellipse at top, rgba(160, 160, 170, 0.45), transparent 65%);
     animation: breathe 2.2s ease-in-out infinite;
   }
   #ambient-glow.glow-thinking {
@@ -50,7 +56,7 @@
     50% { opacity: 0.55; }
   }
   @media (prefers-reduced-motion: reduce) {
-    #ambient-glow.glow-listening, #ambient-glow.glow-thinking {
+    #ambient-glow.glow-listening, #ambient-glow.glow-needs-wake, #ambient-glow.glow-thinking {
       animation: none;
       opacity: 0.35;
     }
@@ -184,23 +190,40 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+let currentState = "disconnected";
+// Epoch ms until which she'll respond to anything without the wake word
+// (main.py's awake_until, seconds, times 1000) - 0 until the first
+// "awake" event arrives, which reads as "needs the wake word" below,
+// a reasonable default for the brief window before that shows up.
+let awakeUntilMs = 0;
+
 function setStatus(state) {
+  currentState = state;
   document.getElementById("state").textContent = state;
   const dot = document.getElementById("dot");
   dot.className = "";
   dot.classList.add("dot-" + state);
+  renderGlow();
+}
 
-  // Ambient background glow - green while she's listening/transcribing,
-  // blue while she's thinking, plain background otherwise (speaking,
-  // sleeping, idle, connecting).
+// Ambient background glow - green while listening AND awake (no wake
+// word needed), gray while listening but dormant (wake word required),
+// blue while thinking, plain background otherwise (speaking, sleeping,
+// idle, connecting). Re-run on a timer too, not just on state changes -
+// the awake window expiring isn't a discrete event on its own, it just
+// becomes true the next time main.py happens to check, so this is the
+// only way the glow notices it lapsed while nothing else changed.
+function renderGlow() {
   const glow = document.getElementById("ambient-glow");
-  glow.classList.remove("glow-listening", "glow-thinking");
-  if (state === "listening" || state === "transcribing") {
-    glow.classList.add("glow-listening");
-  } else if (state === "thinking") {
+  glow.classList.remove("glow-listening", "glow-needs-wake", "glow-thinking");
+  if (currentState === "listening" || currentState === "transcribing") {
+    glow.classList.add(Date.now() < awakeUntilMs ? "glow-listening" : "glow-needs-wake");
+  } else if (currentState === "thinking") {
     glow.classList.add("glow-thinking");
   }
 }
+
+setInterval(renderGlow, 500);
 
 // --- Live status ---
 function connectStream() {
@@ -240,6 +263,10 @@ function connectStream() {
         break;
       case "new_conversation":
         resetConversationView();
+        break;
+      case "awake":
+        awakeUntilMs = evt.until * 1000;
+        renderGlow();
         break;
     }
   };
