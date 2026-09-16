@@ -59,7 +59,11 @@ SYSTEM_PROMPT = (
     "something about the user yet, say so plainly rather than claiming you "
     "have no memory at all. You also have tools to check the current date/"
     "time, list/read files on the user's computer, search the web, fetch a "
-    "specific web page, and write or edit files. When you use a tool, "
+    "specific web page, search for images, and write or edit files. Image "
+    "search shows results on the local dashboard, not out loud - you can't "
+    "see the images either, so after calling it just acknowledge that "
+    "you've pulled them up, don't invent a description of what's in them. "
+    "When you use a tool, "
     "summarize what's useful from the result in your own words rather than "
     "reciting it verbatim - especially file contents or web pages, which "
     "can be long. Writing or editing a file always asks the user to "
@@ -279,6 +283,7 @@ MAX_DIRECTORY_ENTRIES = 100
 MAX_FETCH_CHARS = 6000
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_IMAGE_SEARCH_URL = "https://api.search.brave.com/res/v1/images/search"
 # The model doesn't reliably say anything before calling a tool (sometimes
 # it's dead silence straight into the tool call), and using a tool costs a
 # full extra LLM round-trip - so guarantee an acknowledgment instead of
@@ -332,6 +337,22 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_search",
+            "description": "Search the web for images matching a query and "
+            "display them on the local dashboard. There's no way to show a "
+            "picture out loud, so only use this when the user asks to see, "
+            "find, or look up pictures/photos/images of something - the "
+            "result is visual only, not something to describe back.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Image search query"}},
                 "required": ["query"],
             },
         },
@@ -526,6 +547,44 @@ def tool_web_search(query=None, **_kwargs):
     return "\n".join(lines), {"query": query, "results": structured}
 
 
+def tool_image_search(query=None, **_kwargs):
+    if not query:
+        return "Error: no query given"
+    if not BRAVE_API_KEY:
+        return "Error: image search isn't set up yet - no BRAVE_API_KEY configured."
+    try:
+        response = httpx.get(
+            BRAVE_IMAGE_SEARCH_URL,
+            params={"q": query, "count": 6},
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+            timeout=10,
+        )
+    except httpx.HTTPError as e:
+        return f"Error searching images: {e}"
+    if response.status_code != 200:
+        return f"Error: image search returned HTTP {response.status_code}"
+    results = response.json().get("results", [])
+    structured = []
+    for r in results[:6]:
+        thumbnail = r.get("thumbnail", {}).get("src")
+        if not thumbnail:
+            continue  # nothing to show for this one, skip it
+        structured.append(
+            {
+                "title": r.get("title", ""),
+                "source_url": r.get("url", ""),
+                "thumbnail": thumbnail,
+            }
+        )
+    if not structured:
+        return f"No image results for '{query}'."
+    # The model can't actually see these - it's told just enough to
+    # acknowledge the request without inventing a description of images it
+    # never received.
+    text = f"Found {len(structured)} images for '{query}' - shown on the dashboard, not spoken."
+    return text, {"query": query, "results": structured}
+
+
 def tool_write_file(path=None, content=None, **_kwargs):
     if not path:
         return "Error: no path given"
@@ -580,6 +639,7 @@ TOOL_FUNCTIONS = {
     "list_directory": tool_list_directory,
     "read_file": tool_read_file,
     "web_search": tool_web_search,
+    "image_search": tool_image_search,
     "fetch_url": tool_fetch_url,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
