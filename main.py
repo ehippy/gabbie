@@ -683,18 +683,29 @@ TOOLS = [
         "function": {
             "name": "run_python",
             "description": "Run a Python script and return its printed "
-            "output. Use this to actually execute logic you've written "
-            f"(like a date calculation) instead of working it out "
-            "yourself - mental math and date arithmetic are exactly the "
-            "kind of thing you get wrong that a script won't. Only "
-            f"scripts under {SCRATCH_DIR} can be run - write the script "
-            "there with write_file first. Neither call needs the user to "
-            "confirm out loud - that folder is a low-stakes scratch area, "
-            "unlike writing or editing a file anywhere else.",
+            "output, optionally passing it command-line arguments. Use "
+            "this to actually execute logic you've written (like a date "
+            "calculation) instead of working it out yourself - mental "
+            "math and date arithmetic are exactly the kind of thing you "
+            "get wrong that a script won't. If a script takes an input "
+            "that'll vary (a date, a name), give its __main__ block a "
+            "sys.argv parameter ONCE when you write it, then reuse that "
+            "same script via args for every future input - never write a "
+            "new one-off file just to supply a different value to logic "
+            f"you've already written. Only scripts under {SCRATCH_DIR} "
+            "can be run - write the script there with write_file first. "
+            "Neither call needs the user to confirm out loud - that "
+            "folder is a low-stakes scratch area, unlike writing or "
+            "editing a file anywhere else.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": f"Path to the .py file, under {SCRATCH_DIR}"}
+                    "path": {"type": "string", "description": f"Path to the .py file, under {SCRATCH_DIR}"},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": 'Command-line arguments to pass to the script, e.g. ["2026-12-08"]',
+                    },
                 },
                 "required": ["path"],
             },
@@ -1086,7 +1097,7 @@ def tool_edit_file(path=None, old_text=None, new_text=None, **_kwargs):
     return f"Replaced the text in {p}."
 
 
-def tool_run_python(path=None, **_kwargs):
+def tool_run_python(path=None, args=None, **_kwargs):
     if not path:
         return "Error: no path given"
     SCRATCH_DIR.mkdir(exist_ok=True)
@@ -1099,9 +1110,13 @@ def tool_run_python(path=None, **_kwargs):
         return f"Error: no such file: {target}"
     if target.suffix != ".py":
         return "Error: run_python only runs .py files"
+    if args is None:
+        args = []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return "Error: args must be a list of strings"
     try:
         result = subprocess.run(
-            [sys.executable, str(target)],
+            [sys.executable, str(target), *args],
             capture_output=True,
             text=True,
             timeout=RUN_PYTHON_TIMEOUT_SECONDS,
