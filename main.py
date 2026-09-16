@@ -423,7 +423,12 @@ def mood_worker(client, events, recent_messages):
     events.publish("mood", value=round(new_mood, 2), label=mood_label(new_mood))
 
 
-MAX_TOOL_ROUNDS = 3
+# A single reply can chain many tool calls (read a file, write a fix, run
+# it, read the output, adjust, run again...) - this only bounds a
+# genuinely stuck/looping model, so it's fine to set it high. It doesn't
+# add latency to normal replies, which rarely use more than a couple of
+# rounds anyway.
+MAX_TOOL_ROUNDS = 50
 MAX_FILE_CHARS = 4000
 MAX_DIRECTORY_ENTRIES = 100
 MAX_FETCH_CHARS = 6000
