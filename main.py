@@ -284,6 +284,41 @@ MAX_FETCH_CHARS = 6000
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_IMAGE_SEARCH_URL = "https://api.search.brave.com/res/v1/images/search"
+BRAVE_MAX_RETRIES = 3
+
+
+def _brave_get(url, params):
+    """GET against one of Brave's search endpoints, retrying on a 429 -
+    the Free plan allows only 1 request/second, so two tool calls back to
+    back (e.g. a web search right after an image search) can trip it
+    easily. Returns (response, error_message); error_message is only set
+    on a network-level failure, not an HTTP error status - callers still
+    check response.status_code themselves."""
+    response = None
+    for attempt in range(BRAVE_MAX_RETRIES):
+        try:
+            response = httpx.get(
+                url,
+                params=params,
+                headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+                timeout=10,
+            )
+        except httpx.HTTPError as e:
+            return None, f"Error contacting search: {e}"
+        if response.status_code != 429:
+            return response, None
+        if attempt < BRAVE_MAX_RETRIES - 1:
+            # x-ratelimit-reset lists seconds-until-reset per policy (the
+            # per-second limit first) - fall back to a flat 1.1s if it's
+            # missing rather than guessing something longer.
+            reset = response.headers.get("x-ratelimit-reset", "")
+            try:
+                wait = float(reset.split(",")[0]) + 0.1
+            except ValueError:
+                wait = 1.1
+            log(f"[brave rate-limited, retrying in {wait:.1f}s]")
+            time.sleep(wait)
+    return response, None
 # The model doesn't reliably say anything before calling a tool (sometimes
 # it's dead silence straight into the tool call), and using a tool costs a
 # full extra LLM round-trip - so guarantee an acknowledgment instead of
@@ -522,15 +557,11 @@ def tool_web_search(query=None, **_kwargs):
         return "Error: no query given"
     if not BRAVE_API_KEY:
         return "Error: web search isn't set up yet - no BRAVE_API_KEY configured."
-    try:
-        response = httpx.get(
-            BRAVE_SEARCH_URL,
-            params={"q": query, "count": 5},
-            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
-            timeout=10,
-        )
-    except httpx.HTTPError as e:
-        return f"Error searching: {e}"
+    response, error = _brave_get(BRAVE_SEARCH_URL, {"q": query, "count": 5})
+    if error:
+        return error
+    if response.status_code == 429:
+        return "Error: search is rate-limited right now - wait a few seconds and try again."
     if response.status_code != 200:
         return f"Error: search returned HTTP {response.status_code}"
     results = response.json().get("web", {}).get("results", [])
@@ -556,19 +587,14 @@ def tool_image_search(query=None, **_kwargs):
         return "Error: no query given"
     if not BRAVE_API_KEY:
         return "Error: image search isn't set up yet - no BRAVE_API_KEY configured."
-    try:
-        response = httpx.get(
-            BRAVE_IMAGE_SEARCH_URL,
-            # Brave doesn't offer a server-side size filter, so over-fetch
-            # (its max) and filter by actual source dimensions below -
-            # otherwise a query dominated by small icons/logos could come
-            # back mostly filtered out.
-            params={"q": query, "count": 50},
-            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
-            timeout=10,
-        )
-    except httpx.HTTPError as e:
-        return f"Error searching images: {e}"
+    # Brave doesn't offer a server-side size filter, so over-fetch (its max)
+    # and filter by actual source dimensions below - otherwise a query
+    # dominated by small icons/logos could come back mostly filtered out.
+    response, error = _brave_get(BRAVE_IMAGE_SEARCH_URL, {"q": query, "count": 50})
+    if error:
+        return error
+    if response.status_code == 429:
+        return "Error: image search is rate-limited right now - wait a few seconds and try again."
     if response.status_code != 200:
         return f"Error: image search returned HTTP {response.status_code}"
     results = response.json().get("results", [])
