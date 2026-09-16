@@ -22,6 +22,7 @@ from eventbus import HOST as GABBIE_HOST, PORT as GABBIE_PORT
 from main import (
     MEMORY_PATH,
     NEURALFORGE_URL,
+    RESET_FLAG_PATH,
     TRANSCRIPTS_DIR,
     current_llm_model,
     load_memory,
@@ -214,6 +215,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             save_settings(llm_model=model.strip())
             self._send_json({"llm_model": model.strip()})
+            return
+        if path == "/api/reset":
+            # Existence alone is the signal - main.py's loop notices it
+            # between turns, so this is a no-op if Gabbie isn't running or
+            # is mid-turn right now; it'll pick it up as soon as she's free.
+            RESET_FLAG_PATH.touch()
+            self._send_json({"ok": True})
             return
         self.send_response(404)
         self.end_headers()

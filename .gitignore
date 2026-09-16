@@ -6,3 +6,4 @@ transcripts/
 memory.json
 mood.json
 settings.json
+reset_requested.flag

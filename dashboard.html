@@ -59,7 +59,10 @@
       <div class="row g-4">
         <div class="col-lg-7">
           <div class="card">
-            <div class="card-header">Live</div>
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span>Live</span>
+              <button id="new-conversation-btn" type="button" class="btn btn-sm btn-outline-secondary">New Conversation</button>
+            </div>
             <div class="card-body">
               <div id="live-conversation" class="scroll-panel">
                 <p class="text-secondary small mb-0">Nothing yet - say the wake word to start.</p>
@@ -191,6 +194,9 @@ function connectStream() {
       case "mood":
         setMood(evt.value, evt.label);
         break;
+      case "new_conversation":
+        resetConversationView();
+        break;
     }
   };
   es.onerror = () => {
@@ -217,6 +223,31 @@ function appendConversationLine(role, text, tsIso) {
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
 }
+
+// Clears the Conversation/Tool Activity panels back to their empty state -
+// fires when main.py actually starts the new conversation (see
+// RESET_FLAG_PATH in main.py), not just when the button is clicked, so
+// this only happens once Gabbie has really wiped her own history too.
+function resetConversationView() {
+  document.getElementById("live-conversation").innerHTML =
+    '<p class="text-secondary small mb-0">Nothing yet - say the wake word to start.</p>';
+  document.getElementById("web-activity").innerHTML =
+    '<p class="text-secondary small mb-0">Nothing yet - tool calls (search, files, the clock, etc.) show up here.</p>';
+}
+
+document.getElementById("new-conversation-btn").onclick = async () => {
+  const btn = document.getElementById("new-conversation-btn");
+  btn.disabled = true;
+  btn.textContent = "Starting...";
+  try {
+    await fetch("/api/reset", { method: "POST" });
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = "New Conversation";
+    }, 2000);
+  }
+};
 
 // Rebuilds the conversation feed AND Web Activity from the current
 // session's transcript (the most recent one - main.py starts a fresh

@@ -99,6 +99,9 @@ MEMORY_EXTRACTION_PROMPT = (
 BASE_DIR = Path(__file__).resolve().parent
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
 MEMORY_PATH = BASE_DIR / "memory.json"
+# Existence alone is the signal - dashboard.py's "New Conversation" button
+# touches this file; main.py's loop notices it between turns and clears it.
+RESET_FLAG_PATH = BASE_DIR / "reset_requested.flag"
 MOOD_PATH = BASE_DIR / "mood.json"
 MOOD_MIN, MOOD_MAX = -5, 5
 MOOD_HALF_LIFE_HOURS = 6  # how fast an untouched mood drifts back to neutral
@@ -1216,6 +1219,10 @@ def main():
     awake_until = 0.0
     remember_thread = None
     last_extracted_index = len(messages)
+    # Discard any reset request left over from before this process started -
+    # "New Conversation" should only ever apply to a conversation that's
+    # actually in progress right now.
+    RESET_FLAG_PATH.unlink(missing_ok=True)
     log("Gabbie is listening... (Ctrl+C to quit)")
 
     def refresh_system_prompt():
@@ -1261,6 +1268,18 @@ def main():
     with stream:
         try:
             while True:
+                if RESET_FLAG_PATH.exists():
+                    RESET_FLAG_PATH.unlink()
+                    log("[new conversation requested]")
+                    flush_memory_sync()  # don't lose anything from the conversation being ended
+                    messages[:] = [{"role": "system", "content": build_system_prompt(load_memory(), load_mood())}]
+                    last_extracted_index = len(messages)
+                    transcript_path = open_transcript()
+                    awake_until = 0.0
+                    events.publish("new_conversation")
+                    speak(client, listening_enabled, audio_queue, events, "Okay, starting fresh!")
+                    append_transcript(transcript_path, "assistant", "Okay, starting fresh!")
+
                 log("[listening]")
                 events.publish("listening")
                 audio = listen_for_utterance(vad, audio_queue)
