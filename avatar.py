@@ -69,45 +69,48 @@ def main():
     last_said = ""
 
     running = True
-    while running:
-        for pg_event in pygame.event.get():
-            if pg_event.type == pygame.QUIT:
-                running = False
+    try:
+        while running:
+            for pg_event in pygame.event.get():
+                if pg_event.type == pygame.QUIT:
+                    running = False
 
-        while not event_queue.empty():
-            evt = event_queue.get()
-            kind = evt.get("event")
-            if kind in ("listening", "transcribing", "thinking", "sleeping"):
-                state = kind
-            elif kind == "heard":
-                if not evt.get("ignored"):
-                    last_heard = evt["text"]
-            elif kind == "speaking":
-                state = "speaking"
-                last_said = evt["text"]
-            elif kind == "done_speaking":
-                state = "listening"
-            elif kind == "bye":
-                state = "idle"
+            while not event_queue.empty():
+                evt = event_queue.get()
+                kind = evt.get("event")
+                if kind in ("listening", "transcribing", "thinking", "sleeping"):
+                    state = kind
+                elif kind == "heard":
+                    if not evt.get("ignored"):
+                        last_heard = evt["text"]
+                elif kind == "speaking":
+                    state = "speaking"
+                    last_said = evt["text"]
+                elif kind == "done_speaking":
+                    state = "listening"
+                elif kind == "bye":
+                    state = "idle"
 
-        screen.fill((18, 18, 22))
-        color = STATE_COLORS.get(state, (100, 100, 100))
-        pygame.draw.circle(screen, color, (160, 140), 80)
+            screen.fill((18, 18, 22))
+            color = STATE_COLORS.get(state, (100, 100, 100))
+            pygame.draw.circle(screen, color, (160, 140), 80)
 
-        label = font.render(state, True, (235, 235, 235))
-        screen.blit(label, (160 - label.get_width() // 2, 235))
+            label = font.render(state, True, (235, 235, 235))
+            screen.blit(label, (160 - label.get_width() // 2, 235))
 
-        conn_text = "connected" if connected_flag["connected"] else "waiting for gabbie..."
-        conn_color = (120, 200, 120) if connected_flag["connected"] else (200, 120, 120)
-        screen.blit(small_font.render(conn_text, True, conn_color), (10, 10))
+            conn_text = "connected" if connected_flag["connected"] else "waiting for gabbie..."
+            conn_color = (120, 200, 120) if connected_flag["connected"] else (200, 120, 120)
+            screen.blit(small_font.render(conn_text, True, conn_color), (10, 10))
 
-        if last_heard:
-            screen.blit(small_font.render(f"You: {last_heard}"[:44], True, (170, 170, 170)), (10, 280))
-        if last_said:
-            screen.blit(small_font.render(f"Gabbie: {last_said}"[:44], True, (170, 170, 170)), (10, 305))
+            if last_heard:
+                screen.blit(small_font.render(f"You: {last_heard}"[:44], True, (170, 170, 170)), (10, 280))
+            if last_said:
+                screen.blit(small_font.render(f"Gabbie: {last_said}"[:44], True, (170, 170, 170)), (10, 305))
 
-        pygame.display.flip()
-        clock.tick(30)
+            pygame.display.flip()
+            clock.tick(30)
+    except KeyboardInterrupt:
+        pass
 
     pygame.quit()
 
