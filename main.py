@@ -93,6 +93,10 @@ MOOD_EXTRACTION_PROMPT = (
 )
 BASE_DIR = Path(__file__).resolve().parent
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
+# Which transcript file is "active" - persists across a plain process
+# restart (crash, --watch, Ctrl+C) so the dashboard doesn't see that as a
+# new session; only start_new_transcript()/end_transcript_session() touch it.
+TRANSCRIPT_POINTER_PATH = BASE_DIR / "current_transcript.txt"
 MEMORY_PATH = BASE_DIR / "memory.json"
 # Existence alone is the signal - dashboard.py's "New Conversation" button
 # touches this file; main.py's loop notices it between turns and clears it.
@@ -293,6 +297,38 @@ def open_transcript():
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPTS_DIR / f"{datetime.now().strftime('%Y-%m-%dT%H%M%S')}.jsonl"
     return path
+
+
+def start_new_transcript():
+    """A real new session: an explicit reset, or right after saying
+    goodbye. Rotates to a fresh transcript file and points
+    TRANSCRIPT_POINTER_PATH at it."""
+    path = open_transcript()
+    TRANSCRIPT_POINTER_PATH.write_text(path.name)
+    return path
+
+
+def resume_or_start_transcript():
+    """Reuse the transcript from before this process started (a plain
+    restart - a crash, --watch picking up a code change, Ctrl+C) instead
+    of rotating to a new file, so the dashboard's hydration (which only
+    ever looks at the most recent transcript) doesn't make everything
+    from before the restart look like it vanished. Only an explicit
+    reset or "goodbye" actually end a conversation and clear the
+    pointer - a mere process restart isn't a new session."""
+    if TRANSCRIPT_POINTER_PATH.exists():
+        name = TRANSCRIPT_POINTER_PATH.read_text().strip()
+        if name:
+            # Trust the name without checking the file exists yet -
+            # append_transcript() creates it lazily on first write, so a
+            # reset immediately followed by a restart (nothing said yet)
+            # would otherwise look like an invalid pointer here.
+            return TRANSCRIPTS_DIR / name
+    return start_new_transcript()
+
+
+def end_transcript_session():
+    TRANSCRIPT_POINTER_PATH.unlink(missing_ok=True)
 
 
 def append_transcript(path, role, content):
@@ -1313,7 +1349,7 @@ def main():
     if mood_label(mood):
         log(f"[mood] starting at {mood:.1f} ({mood_label(mood)})")
     messages = [{"role": "system", "content": build_system_prompt(remembered_facts, mood)}]
-    transcript_path = open_transcript()
+    transcript_path = resume_or_start_transcript()
     awake_until = 0.0
     mood_thread = None
     last_extracted_index = len(messages)
@@ -1372,7 +1408,7 @@ def main():
                     flush_mood_sync()  # don't lose the mood shift from the conversation being ended
                     messages[:] = [{"role": "system", "content": build_system_prompt(load_memory(), load_mood())}]
                     last_extracted_index = len(messages)
-                    transcript_path = open_transcript()
+                    transcript_path = start_new_transcript()
                     awake_until = 0.0
                     events.publish("new_conversation")
                     speak(client, listening_enabled, audio_queue, events, "Okay, starting fresh!")
@@ -1405,6 +1441,7 @@ def main():
                     speak(client, listening_enabled, audio_queue, events, "Bye bye!")
                     append_transcript(transcript_path, "assistant", "Bye bye!")
                     flush_mood_sync()
+                    end_transcript_session()  # a real goodbye, not just a restart - next launch starts fresh
                     events.publish("bye")
                     break
 
