@@ -45,7 +45,13 @@ TTS_MODEL = "kokoro-v1"
 TTS_VOICE = "af_heart"
 SYSTEM_PROMPT = (
     "You are Gabbie, a warm, playful voice assistant, speaking out loud in "
-    "a live conversation. Match your reply length to the moment: a simple "
+    "a live conversation. Never use markdown or any other text formatting "
+    "- no asterisks or underscores for emphasis, no bullet points or "
+    "numbered lists, no headers, no code fences or backticks. It's all "
+    "read out loud exactly as written, symbols included, so write "
+    "everything as plain spoken sentences; convey emphasis the way you "
+    "would out loud, through word choice and phrasing, not formatting. "
+    "Match your reply length to the moment: a simple "
     "yes/no or acknowledgment deserves just a word or short phrase ('Yep!', "
     "'Nope, not really.', 'Got it!'), not a full sentence. Never use more "
     "than two short sentences total, and only reach two when there's "
@@ -134,6 +140,29 @@ AFFIRMATIVE_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in AFFIRMA
 WAKE_WORDS = ("gabbie", "gabby", "gabi", "gaby")
 WAKE_PATTERN = re.compile(r"\b(" + "|".join(WAKE_WORDS) + r")\b", re.IGNORECASE)
 SENTENCE_BOUNDARY = re.compile(r"[.!?]+\s+")
+
+
+def strip_markdown(text):
+    """Kokoro (and every OpenAI-compatible TTS endpoint like it) has no
+    concept of markdown - it just reads the literal characters, so
+    "**important**" comes out as "asterisk asterisk important asterisk
+    asterisk" instead of anything resembling emphasis. There's no markup
+    that gets Kokoro to actually emphasize a word either, so this is
+    pure cleanup, not a substitute for real emphasis - the system prompt
+    is the primary defense (asking the model not to use markdown at
+    all); this is the fallback for whatever slips through anyway."""
+    text = re.sub(r"```[a-zA-Z]*\n?", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    return text
 
 
 def log(message):
@@ -1242,7 +1271,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                     buffer = re.sub(r"<think>.*?</think>", "", buffer, flags=re.DOTALL)
                     match = SENTENCE_BOUNDARY.search(buffer)
                     while match:
-                        sentence = buffer[: match.end()].strip()
+                        sentence = strip_markdown(buffer[: match.end()].strip())
                         buffer = buffer[match.end() :]
                         if sentence:
                             sentence_queue.put(sentence)
@@ -1250,12 +1279,14 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                 # Guard against the stream ending mid-<think> (never closed):
                 # don't speak or store the raw reasoning fragment.
                 if "<think>" not in buffer and buffer.strip():
-                    sentence_queue.put(buffer.strip())
-                # Strip here too so a leaked <think> block never ends up in
-                # conversation history or the transcript, even though it's
-                # already kept out of what actually gets spoken above.
+                    sentence_queue.put(strip_markdown(buffer.strip()))
+                # Strip here too so a leaked <think> block (or markdown)
+                # never ends up in conversation history or the transcript,
+                # even though it's already kept out of what actually gets
+                # spoken above.
                 full_reply = re.sub(r"<think>.*?</think>", "", "".join(parts), flags=re.DOTALL)
                 full_reply = re.sub(r"<think>.*$", "", full_reply, flags=re.DOTALL).strip()
+                full_reply = strip_markdown(full_reply)
 
                 if tool_calls:
                     if not full_reply and not filler_spoken:
