@@ -166,6 +166,20 @@
           <div id="model-save-status" class="small text-secondary mt-2"></div>
         </div>
       </div>
+
+      <div class="card mt-4" style="max-width: 32rem;">
+        <div class="card-header">Audio Devices</div>
+        <div class="card-body">
+          <p class="text-secondary small mb-2">
+            Resolved once at startup - restart Gabbie after changing your
+            system's default mic/speaker for this to update. Shown by real
+            device description, not the generic "default" ALSA alias, since
+            that can silently point at something unexpected.
+          </p>
+          <div class="small"><strong>Microphone:</strong> <span id="audio-mic">Loading...</span></div>
+          <div class="small"><strong>Speaker:</strong> <span id="audio-speaker">Loading...</span></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -414,6 +428,12 @@ async function saveModel() {
   });
   status.textContent = res.ok ? "Saved - takes effect on the next reply." : "Failed to save.";
   setTimeout(() => { status.textContent = ""; }, 4000);
+}
+
+async function loadAudioDevices() {
+  const devices = await fetch("/api/audio-devices").then((r) => r.json());
+  document.getElementById("audio-mic").textContent = devices.mic || "unknown - has Gabbie been started yet?";
+  document.getElementById("audio-speaker").textContent = devices.speaker || "unknown - has Gabbie been started yet?";
 }
 
 // --- Memory ---
@@ -674,6 +694,7 @@ loadMemory();
 loadMood();
 loadTranscriptList();
 loadSettings();
+loadAudioDevices();
 </script>
 
 </body>

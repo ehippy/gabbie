@@ -9,3 +9,4 @@ settings.json
 reset_requested.flag
 current_transcript.txt
 scratch/
+audio_devices.json

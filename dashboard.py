@@ -21,6 +21,7 @@ import httpx
 
 from eventbus import HOST as GABBIE_HOST, PORT as GABBIE_PORT
 from main import (
+    AUDIO_DEVICES_PATH,
     MEMORY_PATH,
     NEURALFORGE_URL,
     RESET_FLAG_PATH,
@@ -85,6 +86,15 @@ def update_fact(ts, new_text):
             MEMORY_PATH.write_text(json.dumps(facts, indent=2))
             return f["ts"]
     return None
+
+
+def load_audio_devices():
+    if not AUDIO_DEVICES_PATH.exists():
+        return {"mic": None, "speaker": None}
+    try:
+        return json.loads(AUDIO_DEVICES_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"mic": None, "speaker": None}
 
 
 def list_available_models():
@@ -166,6 +176,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             self._send_json({"llm_model": current_llm_model()})
+            return
+
+        if path == "/api/audio-devices":
+            self._send_json(load_audio_devices())
             return
 
         if path == "/api/transcripts":

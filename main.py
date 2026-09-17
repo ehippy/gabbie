@@ -119,6 +119,10 @@ TRANSCRIPT_POINTER_PATH = BASE_DIR / "current_transcript.txt"
 # scripts written here (via write_file first) can be run at all.
 SCRATCH_DIR = BASE_DIR / "scratch"
 RUN_PYTHON_TIMEOUT_SECONDS = 10
+# Snapshot of the mic/speaker resolved at the most recent startup - written
+# once by main() at boot, read by the dashboard so there's visibility into
+# what's actually in use without needing main.py's own process.
+AUDIO_DEVICES_PATH = BASE_DIR / "audio_devices.json"
 MEMORY_PATH = BASE_DIR / "memory.json"
 # Existence alone is the signal - dashboard.py's "New Conversation" button
 # touches this file; main.py's loop notices it between turns and clears it.
@@ -1487,7 +1491,39 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
         listening_enabled.set()
 
 
+def current_audio_device_names():
+    """Best-effort human-readable names for the mic/speaker actually in
+    use. PortAudio's own view of "default" is a generic ALSA alias that
+    can silently resolve to something unexpected - observed directly on
+    the dev machine, where it was a webcam's mic rather than the
+    headset - so this asks pactl (PipeWire/PulseAudio) for the real
+    default sink/source and their friendly descriptions first, falling
+    back to whatever PortAudio itself reports if pactl isn't available
+    (not Linux, or a plain-ALSA setup with no PipeWire/Pulse)."""
+    try:
+        info = json.loads(subprocess.run(["pactl", "-f", "json", "info"], capture_output=True, text=True, timeout=3).stdout)
+        sinks = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sinks"], capture_output=True, text=True, timeout=3).stdout)
+        sources = json.loads(
+            subprocess.run(["pactl", "-f", "json", "list", "sources"], capture_output=True, text=True, timeout=3).stdout
+        )
+        sink_name = next((s["description"] for s in sinks if s["name"] == info.get("default_sink_name")), None)
+        source_name = next((s["description"] for s in sources if s["name"] == info.get("default_source_name")), None)
+        if sink_name and source_name:
+            return source_name, sink_name
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError):
+        pass
+    try:
+        return sd.query_devices(kind="input")["name"], sd.query_devices(kind="output")["name"]
+    except Exception:
+        return None, None
+
+
 def main():
+    mic_name, speaker_name = current_audio_device_names()
+    log(f"[audio] mic: {mic_name or '(unknown)'}")
+    log(f"[audio] speaker: {speaker_name or '(unknown)'}")
+    AUDIO_DEVICES_PATH.write_text(json.dumps({"mic": mic_name, "speaker": speaker_name}))
+
     log("Loading speech-to-text model...")
     whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
     client = OpenAI(base_url=NEURALFORGE_URL, api_key="not-needed")
