@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*")
 
 import httpx
-from faster_whisper import WhisperModel
+import paho.mqtt.client as mqtt_client
 from openai import OpenAI
 import numpy as np
 import sounddevice as sd
@@ -43,6 +43,19 @@ NEURALFORGE_URL = "http://neuralforge:13305/v1"
 DEFAULT_LLM_MODEL = "Qwen3.8-27B-GGUF-UD-Q4_K_XL"
 TTS_MODEL = "kokoro-v1"
 TTS_VOICE = "af_heart"
+STT_MODEL = "Whisper-Tiny"
+
+# crumb's Mosquitto broker - the same one axon-native itself talks to.
+# PTT_TOPIC carries axon's Whisplay button edges (see
+# axon/software/axon-native/src/mqtt.rs's PttPublisher); payload is just
+# the literal bytes "start"/"stop", not JSON, since it's a single
+# edge-triggered signal with nothing else to carry. AGENTS_TOPIC is the
+# same agent-status stream axon-native's own dashboard subscribes to (see
+# AgentWatcher).
+MQTT_BROKER = "crumb.local"
+MQTT_PORT = 1883
+PTT_TOPIC = "axon/ptt"
+AGENTS_TOPIC = "axon/agents/+/status"
 SYSTEM_PROMPT = (
     "You are Gabbie, a warm, playful voice assistant, speaking out loud in "
     "a live conversation. Never use markdown or any other text formatting "
@@ -127,6 +140,15 @@ MEMORY_PATH = BASE_DIR / "memory.json"
 # Existence alone is the signal - dashboard.py's "New Conversation" button
 # touches this file; main.py's loop notices it between turns and clears it.
 RESET_FLAG_PATH = BASE_DIR / "reset_requested.flag"
+# gabbie has no way to deliver a message into another Claude Code session
+# herself (that needs mcp__ccd_session_mgmt__send_message, which only an
+# interactive Claude Code session can call, and explicitly not an
+# unattended one either - so no background watcher process could do this
+# on her behalf). She just appends the request here; a human asks Claude
+# (in a real session) to check this file, match the target via
+# list_sessions, and deliver it with send_message - the human/Claude
+# checkpoint that send_message effectively requires anyway.
+RELAY_QUEUE_PATH = BASE_DIR / "relay_queue.jsonl"
 MOOD_PATH = BASE_DIR / "mood.json"
 MOOD_MIN, MOOD_MAX = -5, 5
 MOOD_HALF_LIFE_HOURS = 6  # how fast an untouched mood drifts back to neutral
@@ -140,7 +162,7 @@ NEGATIVE_WORDS = ("no", "nope", "don't", "do not", "stop", "cancel", "negative",
 AFFIRMATIVE_WORDS = ("yes", "yeah", "yep", "yup", "sure", "go ahead", "do it", "confirm", "affirmative", "okay", "ok")
 NEGATIVE_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in NEGATIVE_WORDS) + r")\b", re.IGNORECASE)
 AFFIRMATIVE_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in AFFIRMATIVE_WORDS) + r")\b", re.IGNORECASE)
-# faster-whisper hears "Gabbie" a few different ways in practice.
+# Whisper hears "Gabbie" a few different ways in practice.
 WAKE_WORDS = ("gabbie", "gabby", "gabi", "gaby")
 WAKE_PATTERN = re.compile(r"\b(" + "|".join(WAKE_WORDS) + r")\b", re.IGNORECASE)
 SENTENCE_BOUNDARY = re.compile(r"[.!?]+\s+")
@@ -216,6 +238,172 @@ def listen_for_utterance(vad, audio_queue):
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+class PttListener:
+    """Subscribes to axon's physical button over MQTT and exposes whether
+    it's currently held down. A walkie-talkie trigger, not a chat client -
+    connects once at startup and just tracks button state in the
+    background; reconnects on drop the same way axon's own daemon does."""
+
+    def __init__(self):
+        self.active = threading.Event()
+        self._client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        self._client.on_message = self._on_message
+        self._client.on_connect = self._on_connect
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        client.subscribe(PTT_TOPIC)
+
+    def _on_message(self, client, userdata, msg):
+        payload = msg.payload.decode(errors="replace")
+        if payload == "start":
+            # Barge-in: halts whatever's playing right now, immediately -
+            # a no-op if nothing is (sd.stop() is always safe to call).
+            # think_and_speak's draining loop (see its `interrupted` check)
+            # is what stops it from just playing the *next* queued sentence
+            # right after.
+            sd.stop(ignore_errors=True)
+            self.active.set()
+        elif payload == "stop":
+            self.active.clear()
+
+    def start(self):
+        try:
+            self._client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        except OSError as e:
+            log(f"[ptt] mqtt connect to {MQTT_BROKER}:{MQTT_PORT} failed: {e} (will keep retrying)")
+        self._client.loop_start()  # paho retries connection in the background
+
+
+class AgentWatcher:
+    """Mirrors axon/agents/+/status over MQTT - the same broker/topic
+    axon-native itself subscribes to for the dashboard - so gabbie can talk
+    about other agents' status (see tool_list_agents) and proactively flag
+    when one needs attention. A direct, independent read of the same
+    source of truth, not a round trip through axon-native.
+
+    Proactive speech is deliberately narrow - only "error" transitions get
+    queued into `announcements` for an unprompted interruption; that's
+    genuinely time-sensitive. An agent going idle/waiting for input is not
+    - axon-native's own RGB LED already flashes for that transition (it
+    watches the same MQTT stream directly), and list_agents covers it if
+    you ask. Speaking up for every idle transition would make her naggy.
+    """
+
+    def __init__(self):
+        self.agents = {}  # source -> {"state", "task", "ts"}
+        self.announcements = queue.Queue()
+        self._lock = threading.Lock()
+        self._client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        self._client.on_message = self._on_message
+        self._client.on_connect = self._on_connect
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        client.subscribe(AGENTS_TOPIC)
+
+    def _on_message(self, client, userdata, msg):
+        parts = msg.topic.split("/")
+        if len(parts) != 4:
+            return
+        source = parts[2]
+        try:
+            payload = json.loads(msg.payload.decode())
+        except json.JSONDecodeError:
+            return
+        state = payload.get("state", "idle")
+        task = payload.get("task", "")
+        with self._lock:
+            previous = self.agents.get(source)
+            self.agents[source] = {"state": state, "task": task, "ts": time.time()}
+            became_error = state == "error" and (previous is None or previous["state"] != "error")
+        if became_error:
+            detail = f" while {task}" if task else ""
+            self.announcements.put(f"Heads up - {source} just hit an error{detail}.")
+
+    def start(self):
+        try:
+            self._client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        except OSError as e:
+            log(f"[agents] mqtt connect to {MQTT_BROKER}:{MQTT_PORT} failed: {e} (will keep retrying)")
+        self._client.loop_start()
+
+    def summary(self):
+        with self._lock:
+            items = {k: dict(v) for k, v in self.agents.items()}
+        if not items:
+            return "No agents are currently reporting status."
+        lines = []
+        for source, info in sorted(items.items()):
+            age = time.time() - info["ts"]
+            age_str = "just now" if age < 60 else f"{int(age // 60)}m ago"
+            task = info["task"] or "no task noted"
+            lines.append(f"{source}: {info['state']}, {task} (updated {age_str})")
+        return "\n".join(lines)
+
+
+def capture_ptt(audio_queue, ptt):
+    """Collects raw frames from audio_queue for as long as the button is
+    held, no VAD gating at all - holding it down is the whole signal."""
+    drain_queue(audio_queue)  # discard whatever accumulated before the press
+    frames = []
+    while ptt.active.is_set() or not audio_queue.empty():
+        try:
+            frames.append(audio_queue.get(timeout=0.1))
+        except queue.Empty:
+            if not ptt.active.is_set():
+                break
+    pcm = b"".join(frames)
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def listen_for_utterance_or_ptt(vad, audio_queue, ptt, agent_watcher):
+    """Same as listen_for_utterance, except a held axon button preempts VAD
+    entirely - returns (audio, via_ptt); via_ptt utterances skip the wake
+    word gate upstream, since holding the button down already is the
+    "I'm talking to you" signal VAD's wake word normally stands in for.
+
+    Also bails out early (empty audio) the moment a proactive announcement
+    (see AgentWatcher) is pending, so an "agent just errored" heads-up
+    doesn't sit queued behind an indefinite VAD wait - the caller's main
+    loop picks it up and speaks it before listening again."""
+    if ptt.active.is_set():
+        return capture_ptt(audio_queue, ptt), True
+    if not agent_watcher.announcements.empty():
+        return np.array([], dtype=np.float32), False
+
+    ring_buffer = collections.deque(maxlen=PADDING_FRAMES)
+    triggered = False
+    voiced_frames = []
+
+    while True:
+        if ptt.active.is_set():
+            drain_queue(audio_queue)  # whatever VAD had buffered is stale now
+            return capture_ptt(audio_queue, ptt), True
+        if not agent_watcher.announcements.empty():
+            return np.array([], dtype=np.float32), False
+        try:
+            frame = audio_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        is_speech = vad.is_speech(frame, SAMPLE_RATE)
+
+        if not triggered:
+            ring_buffer.append((frame, is_speech))
+            voiced = sum(1 for f, s in ring_buffer if s)
+            if voiced > START_RATIO * ring_buffer.maxlen:
+                triggered = True
+                voiced_frames.extend(f for f, s in ring_buffer)
+                ring_buffer.clear()
+        else:
+            voiced_frames.append(frame)
+            ring_buffer.append((frame, is_speech))
+            unvoiced = sum(1 for f, s in ring_buffer if not s)
+            if unvoiced > END_RATIO * ring_buffer.maxlen:
+                break
+
+    pcm = b"".join(voiced_frames)
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0, False
+
+
 def contains_wake_word(text):
     return bool(WAKE_PATTERN.search(text))
 
@@ -233,24 +421,25 @@ def contains_affirmative(text):
     return bool(AFFIRMATIVE_PATTERN.search(text))
 
 
-def transcribe(whisper, audio):
+def transcribe(client, audio):
     if audio.size == 0:
         return ""
-    # Whisper is well known to hallucinate text on silence/near-silence,
-    # and initial_prompt makes it worse here specifically - it conditions
-    # the decoder on "Gabbie" as prior context, so a quiet room that
-    # barely trips the VAD upstream can come back as "Gabbie Gabbie" with
-    # nobody having said anything. hotwords biases recognition toward the
-    # wake word the same way without that conditioning effect, vad_filter
-    # runs a second, more precise VAD pass to skip non-speech chunks
-    # before decoding at all, and the no_speech_prob check below is a last
-    # line of defense against whatever gets through anyway.
-    segments, _ = whisper.transcribe(
-        audio, language="en", hotwords="Gabbie", vad_filter=True
-    )
-    return " ".join(
-        segment.text.strip() for segment in segments if segment.no_speech_prob < 0.6
-    ).strip()
+    # No prompt/hotwords passed deliberately - Whisper is well known to
+    # hallucinate text on silence/near-silence, and conditioning the
+    # decoder on "Gabbie" as prior context (the old local-whisper version's
+    # initial_prompt/hotwords) made a quiet room come back as "Gabbie
+    # Gabbie" with nobody having said anything.
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, audio, SAMPLE_RATE, format="WAV")
+    wav_buffer.seek(0)
+    try:
+        result = client.audio.transcriptions.create(
+            model=STT_MODEL, file=("speech.wav", wav_buffer, "audio/wav"), language="en"
+        )
+    except Exception as e:
+        log(f"[transcribe error] {e}")
+        return ""
+    return (result.text or "").strip()
 
 
 def synthesize(client, text):
@@ -528,6 +717,44 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_agents",
+            "description": "Check what the other AI agents in the house "
+            "are doing right now - each one's current state (running, "
+            "idle, or error), what task it's on, and how recently it last "
+            "reported in. Use this whenever the user asks what an agent is "
+            "up to, whether anything needs attention, or asks to check in "
+            "on the swarm.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "relay_to_agent",
+            "description": "Queue a message to hand off to one of the "
+            "other AI agents (e.g. pixelforge, hermes) - use when the user "
+            "asks you to tell an agent something, have it do something, or "
+            "pass along an instruction. Not instant - it's queued and "
+            "delivered by a Claude Code session checking in periodically, "
+            "usually within a couple minutes, so say it's queued rather "
+            "than implying it already went out.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "The agent's exact canonical name, e.g. \"pixelforge\" or \"hermes\" - this has to match "
+                        "that agent's session name precisely, so use the exact name, not a description of it",
+                    },
+                    "message": {"type": "string", "description": "The message to relay, as a standalone instruction (resolve pronouns/context - it'll be delivered with no surrounding conversation)"},
+                },
+                "required": ["target", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_memory",
             "description": "Correct an existing memory - use when a "
             "previously remembered fact turns out to be outdated or "
@@ -781,6 +1008,25 @@ def tool_list_memories(**_kwargs):
     if not facts:
         return "No memories saved yet."
     return "\n".join(f"- {f['fact']}" for f in facts)
+
+
+def tool_list_agents(agent_watcher=None, **_kwargs):
+    if agent_watcher is None:
+        return "Agent status isn't available right now."
+    return agent_watcher.summary()
+
+
+def tool_relay_to_agent(target=None, message=None, **_kwargs):
+    if not target or not message:
+        return "Error: need both target and message"
+    entry = {"target": target.strip(), "message": message.strip(), "ts": time.time(), "delivered": False}
+    with open(RELAY_QUEUE_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    log(f"[relay queued] -> {entry['target']}: {entry['message']}")
+    return (
+        f"Queued for {entry['target']}. I can't send it myself - it'll go out "
+        "next time Patrick asks Claude to check the relay queue."
+    )
 
 
 def tool_edit_memory(old_fact=None, new_fact=None, events=None, **_kwargs):
@@ -1173,6 +1419,8 @@ TOOL_FUNCTIONS = {
     "get_current_datetime": tool_get_current_datetime,
     "remember": tool_remember,
     "list_memories": tool_list_memories,
+    "list_agents": tool_list_agents,
+    "relay_to_agent": tool_relay_to_agent,
     "edit_memory": tool_edit_memory,
     "forget_memory": tool_forget_memory,
     "list_directory": tool_list_directory,
@@ -1187,13 +1435,14 @@ TOOL_FUNCTIONS = {
 }
 
 
-def execute_tool(name, arguments_json, client=None, events=None):
+def execute_tool(name, arguments_json, client=None, events=None, agent_watcher=None):
     """Returns (text_for_the_model, extra_for_display). extra_for_display is
     None unless the tool has something worth showing visually (e.g. search
     results) - most tools just return a plain string, normalized here.
-    client is only used by view_image (needs it for the vision call) and
-    events only by the memory tools (to notify the dashboard) - every
-    other tool ignores both via its **_kwargs catch-all."""
+    client is only used by view_image (needs it for the vision call),
+    events only by the memory tools (to notify the dashboard), and
+    agent_watcher only by list_agents - every other tool ignores all three
+    via its **_kwargs catch-all."""
     try:
         kwargs = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError:
@@ -1202,7 +1451,7 @@ def execute_tool(name, arguments_json, client=None, events=None):
     if not func:
         return f"Error: unknown tool '{name}'", None
     try:
-        result = func(client=client, events=events, **kwargs)
+        result = func(client=client, events=events, agent_watcher=agent_watcher, **kwargs)
     except Exception as e:
         return f"Error running {name}: {e}", None
     if isinstance(result, tuple):
@@ -1225,7 +1474,7 @@ def speak(client, listening_enabled, audio_queue, events, text):
         listening_enabled.set()
 
 
-def confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisper, description):
+def confirm_with_user(client, listening_enabled, audio_queue, events, vad, description):
     """Speaks the proposed action and blocks until a clear yes/no comes
     back. Runs on the same thread that owns audio playback (see the
     "confirm" branch in think_and_speak's draining loop below) - never call
@@ -1239,7 +1488,7 @@ def confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisp
         audio = listen_for_utterance(vad, audio_queue)
         if audio.size < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
             continue
-        text = transcribe(whisper, audio)
+        text = transcribe(client, audio)
         if not text:
             continue
         log(f"[confirmation response] {text}")
@@ -1252,7 +1501,7 @@ def confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisp
     return False
 
 
-def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper, messages, transcript_path):
+def think_and_speak(client, listening_enabled, audio_queue, events, vad, ptt, agent_watcher, messages, transcript_path):
     """Stream the LLM reply, synthesizing and playing each sentence as soon
     as it's complete instead of waiting for the whole reply. Returns the
     full reply text once everything has finished playing."""
@@ -1289,6 +1538,14 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 for chunk in llm_stream:
+                    if ptt.active.is_set():
+                        # Barge-in mid-generation - stop pulling more
+                        # tokens (closing the stream early) rather than
+                        # finishing a reply nobody's going to hear, which
+                        # would otherwise sit there contending with the new
+                        # turn for neuralforge's one inference slot.
+                        sentence_queue.put(None)
+                        return
                     delta = chunk.choices[0].delta
                     if delta.tool_calls:
                         for tc in delta.tool_calls:
@@ -1371,7 +1628,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                             approved = response_box.get()
                             if approved:
                                 result_text, result_extra = execute_tool(
-                                    c["name"], c["arguments"], client=client, events=events
+                                    c["name"], c["arguments"], client=client, events=events, agent_watcher=agent_watcher
                                 )
                             else:
                                 result_text, result_extra = (
@@ -1380,7 +1637,7 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                                 )
                         else:
                             result_text, result_extra = execute_tool(
-                                c["name"], c["arguments"], client=client, events=events
+                                c["name"], c["arguments"], client=client, events=events, agent_watcher=agent_watcher
                             )
                         events.publish(
                             "tool_call",
@@ -1444,12 +1701,28 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
 
         first_clip_at = None
         t0 = time.time()
+        interrupted = False
+        spoken_sentences = []
         while True:
             item = clip_queue.get()
             if item is None:
                 break
+            if ptt.active.is_set():
+                # Barge-in: PttListener already halted whatever was
+                # playing (see its _on_message) - this just stops the
+                # *next* queued sentence from starting right after. Keep
+                # draining (not breaking outright) so tts_worker/llm_worker
+                # can still reach their end-of-stream sentinel and exit
+                # cleanly instead of blocking forever on a full queue.
+                interrupted = True
             kind, payload = item
             if kind == "confirm":
+                description, response_box = payload
+                if interrupted:
+                    # Can't ask a spoken question mid-interrupt - default
+                    # to "no", same as confirm_with_user's own no-answer case.
+                    response_box.put(False)
+                    continue
                 if first_clip_at is None:
                     # The confirmation question is genuinely the first thing
                     # spoken this turn - count it, so the timer below doesn't
@@ -1457,22 +1730,29 @@ def think_and_speak(client, listening_enabled, audio_queue, events, vad, whisper
                     first_clip_at = time.time()
                     log(f"[first audio after {first_clip_at - t0:.1f}s]")
                     events.publish("first_audio", seconds=round(first_clip_at - t0, 1))
-                description, response_box = payload
                 response_box.put(
-                    confirm_with_user(client, listening_enabled, audio_queue, events, vad, whisper, description)
+                    confirm_with_user(client, listening_enabled, audio_queue, events, vad, description)
                 )
                 continue
             sentence, audio, sr = payload
+            if interrupted:
+                continue
             if first_clip_at is None:
                 first_clip_at = time.time()
                 log(f"[first audio after {first_clip_at - t0:.1f}s]")
                 events.publish("first_audio", seconds=round(first_clip_at - t0, 1))
             log(f"Gabbie: {sentence}")
             events.publish("speaking", text=sentence)
+            spoken_sentences.append(sentence)
             sd.play(audio, sr)
             sd.wait()
 
-        if first_clip_at is None:
+        if interrupted:
+            # Record what was actually said, not whatever the (possibly
+            # much longer, entirely unspoken) full reply would have been.
+            full_text["reply"] = " ".join(spoken_sentences)
+            log(f"[interrupted by button hold, {len(spoken_sentences)} sentence(s) spoken]")
+        elif first_clip_at is None:
             # Both attempts came back empty - don't leave the user met with
             # silence and wondering if she heard them at all.
             fallback = "Sorry, could you say that again?"
@@ -1524,10 +1804,16 @@ def main():
     log(f"[audio] speaker: {speaker_name or '(unknown)'}")
     AUDIO_DEVICES_PATH.write_text(json.dumps({"mic": mic_name, "speaker": speaker_name}))
 
-    log("Loading speech-to-text model...")
-    whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
     client = OpenAI(base_url=NEURALFORGE_URL, api_key="not-needed")
     vad = webrtcvad.Vad(VAD_MODE)
+
+    ptt = PttListener()
+    ptt.start()
+    log(f"[ptt] listening for axon's button on {MQTT_BROKER}:{MQTT_PORT} ({PTT_TOPIC})")
+
+    agent_watcher = AgentWatcher()
+    agent_watcher.start()
+    log(f"[agents] watching {MQTT_BROKER}:{MQTT_PORT} ({AGENTS_TOPIC})")
 
     events = EventBus()
     if events.start():
@@ -1613,21 +1899,29 @@ def main():
                     speak(client, listening_enabled, audio_queue, events, "Okay, starting fresh!")
                     append_transcript(transcript_path, "assistant", "Okay, starting fresh!")
 
+                if not agent_watcher.announcements.empty():
+                    text = agent_watcher.announcements.get()
+                    log(f"Gabbie: {text}  [proactive]")
+                    speak(client, listening_enabled, audio_queue, events, text)
+                    messages.append({"role": "assistant", "content": text})
+                    append_transcript(transcript_path, "assistant", text)
+                    continue
+
                 log("[listening]")
                 events.publish("listening")
-                audio = listen_for_utterance(vad, audio_queue)
+                audio, via_ptt = listen_for_utterance_or_ptt(vad, audio_queue, ptt, agent_watcher)
                 if audio.size < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
                     continue
 
                 log("[transcribing]")
                 events.publish("transcribing")
                 t0 = time.time()
-                text = transcribe(whisper, audio)
+                text = transcribe(client, audio)
                 if not text:
                     continue
 
                 already_awake = time.time() < awake_until
-                if not already_awake and not contains_wake_word(text):
+                if not via_ptt and not already_awake and not contains_wake_word(text):
                     log(f"You: {text}  ({time.time() - t0:.1f}s)  [no wake word, ignored]")
                     events.publish("heard", text=text, ignored=True)
                     continue
@@ -1668,7 +1962,7 @@ def main():
                 events.publish("thinking")
                 t0 = time.time()
                 reply = think_and_speak(
-                    client, listening_enabled, audio_queue, events, vad, whisper, messages, transcript_path
+                    client, listening_enabled, audio_queue, events, vad, ptt, agent_watcher, messages, transcript_path
                 )
                 # Start the awake window now that the mic is live again,
                 # rather than from when the user last spoke - otherwise a

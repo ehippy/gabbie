@@ -1,0 +1,15 @@
+[Unit]
+Description=Gabbie voice assistant (axon mic/speaker, push-to-talk via MQTT)
+After=network.target sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/gabbie
+ExecStart=/home/pi/gabbie/.venv/bin/python3 /home/pi/gabbie/main.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+User=pi
+
+[Install]
+WantedBy=multi-user.target
